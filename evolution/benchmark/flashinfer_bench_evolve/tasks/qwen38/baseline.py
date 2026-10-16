@@ -3,7 +3,9 @@
 Adapted from mlc-ai/qwen38-inference at
 05e8ef0db302a2c005994b79d9a5e78b96e2d88b (Apache-2.0).
 """
+from contextlib import contextmanager
 import math
+import os
 import time
 
 import torch
@@ -70,9 +72,39 @@ def all_tensors(cache):
             +list(cache.verify_conv_storage.values())+list(cache.verify_recurrent.values()))
 
 
+@contextmanager
+def _snapshot_allocator(enabled):
+    """Temporarily parallelize registration of reference host buffers."""
+    version = tuple(int(part) for part in torch.__version__.split(".")[:2])
+    if not enabled or version < (2, 13) or any(name in os.environ for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")):
+        yield
+        return
+    memory = torch.cuda.memory
+    if not hasattr(memory, "_set_allocator_settings") or not hasattr(memory, "_snapshot"):
+        yield
+        return
+    settings = memory._snapshot().get("allocator_settings", {})
+    required = ("PYTORCH_CUDA_ALLOC_CONF", "pinned_use_cuda_host_register", "pinned_num_register_threads")
+    if any(name not in settings for name in required) or settings["pinned_use_cuda_host_register"]:
+        yield
+        return
+    original = settings["PYTORCH_CUDA_ALLOC_CONF"]
+    prefix = original + "," if original else ""
+    threads = min(8, len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1)
+    restore = (prefix + f"pinned_use_cuda_host_register:{settings['pinned_use_cuda_host_register']},"
+               + f"pinned_num_register_threads:{settings['pinned_num_register_threads']}")
+    try:
+        memory._set_allocator_settings(prefix + f"pinned_use_cuda_host_register:True,pinned_num_register_threads:{threads}")
+        yield
+    finally:
+        memory._set_allocator_settings(restore)
+        memory._set_allocator_settings(original)
+
+
 def snapshot(tensor):
     """One independent CPU copy, pinned for CUDA transfers."""
-    output = torch.empty_like(tensor, device="cpu", pin_memory=tensor.is_cuda)
+    with _snapshot_allocator(tensor.is_cuda):
+        output = torch.empty_like(tensor, device="cpu", pin_memory=tensor.is_cuda)
     output.copy_(tensor)
     return output
 
