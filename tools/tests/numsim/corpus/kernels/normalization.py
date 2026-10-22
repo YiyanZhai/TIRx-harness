@@ -399,7 +399,6 @@ def prepare_flashinfer_fused_add_rmsnorm_case() -> NumSimCase:
     residual = np.linspace(0.25, 1.25, 128, dtype=np.float16)
     weight = np.linspace(0.5, 1.5, 128, dtype=np.float16)
     summed = values.astype(np.float32) + residual.astype(np.float32)
-    output = np.full(values.shape, np.nan, dtype=np.float16)
     kernel = _specialize(
         module.get_kernel(
             variant="fused_add_rmsnorm",
@@ -514,14 +513,14 @@ def prepare_flashinfer_fused_add_rmsnorm_quant_case() -> NumSimCase:
 
 
 __all__ = [
+    "prepare_flashinfer_add_rmsnorm_fp4quant_case",
     "prepare_flashinfer_fused_add_rmsnorm_case",
     "prepare_flashinfer_fused_add_rmsnorm_quant_case",
-    "prepare_flashinfer_add_rmsnorm_fp4quant_case",
     "prepare_flashinfer_fused_dit_layernorm_case",
     "prepare_flashinfer_layernorm_case",
     "prepare_flashinfer_qk_rmsnorm_case",
     "prepare_flashinfer_rmsnorm_case",
-    "prepare_flashinfer_rmsnorm_quant_case",
     "prepare_flashinfer_rmsnorm_fp4quant_case",
+    "prepare_flashinfer_rmsnorm_quant_case",
     "prepare_rmsnorm_case",
 ]

@@ -222,7 +222,10 @@ def decode_ptx_call(call: Any) -> DecodedPtxCall:
         _raise(
             call,
             op_name,
-            f"expected {len(entry.slots)} modifier token(s) and one marker, got {len(args)} total argument(s)",
+            (
+                f"expected {len(entry.slots)} modifier token(s) and one marker, "
+                f"got {len(args)} total argument(s)"
+            ),
         )
 
     marker = _string_imm(call, op_name, args[-1], text_tokens[-1], field="trailing marker")
@@ -258,7 +261,10 @@ def decode_ptx_call(call: Any) -> DecodedPtxCall:
             _raise(
                 call,
                 op_name,
-                f"{label} marker position(s) {invalid} outside operand lane range [0, {logical_lane_count})",
+                (
+                    f"{label} marker position(s) {invalid} "
+                    f"outside operand lane range [0, {logical_lane_count})"
+                ),
             )
 
     expected_pred_registers = frozenset(
@@ -294,7 +300,8 @@ def decode_ptx_call(call: Any) -> DecodedPtxCall:
             call,
             op_name,
             f"schema requires {present_operand_count} present operand lane(s)"
-            f"{' plus one instruction predicate' if predicated else ''}, got {len(serialized_operands)}",
+            f"{' plus one instruction predicate' if predicated else ''}"
+            f", got {len(serialized_operands)}",
         )
 
     predicate = serialized_operands[-1] if predicated else None
@@ -429,9 +436,9 @@ def register_native_ptx_decoder(payload_schema: Any) -> None:
 
 
 __all__ = [
-    "DecodedPtxCall",
     "PTX_SCHEMA_BY_OP_NAME",
     "PTX_SINK",
+    "DecodedPtxCall",
     "PtxCallDecodeError",
     "decode_ptx_call",
     "register_native_ptx_decoder",

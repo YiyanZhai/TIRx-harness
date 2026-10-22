@@ -1,10 +1,11 @@
 """Raw MXF8 M=128 CTA-pair probe: nonzero data and independent per-row scales."""
 
 import numpy as np
+from tests.numsim.microtests.harness import PairedBuffer
+
+from tvm.backend.cuda.tile_primitive.tma_utils import SwizzleMode, mma_shared_layout
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
-from tvm.backend.cuda.tile_primitive.tma_utils import SwizzleMode, mma_shared_layout
-from tests.numsim.microtests.harness import PairedBuffer
 from tvm.tirx.layout import tmem_datapath_layout
 
 _A_LAYOUT = mma_shared_layout("float8_e4m3fn", SwizzleMode.SWIZZLE_32B_ATOM, (64, 32))
@@ -32,7 +33,7 @@ def _raw_mxf8_cta2_m128(
     shared_a = T.alloc_buffer((64, 32), "float8_e4m3fn", scope="shared", layout=_A_LAYOUT)
     shared_b = T.alloc_buffer((16, 32), "float8_e4m3fn", scope="shared", layout=_B_LAYOUT)
     # Declare the physical allocation used by the raw TMEM addresses below.
-    tmem = T.decl_buffer(
+    tmem = T.decl_buffer(  # noqa: F841
         (128, 32),
         "uint32",
         scope="tmem",

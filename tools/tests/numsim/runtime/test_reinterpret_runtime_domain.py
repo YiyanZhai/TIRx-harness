@@ -7,12 +7,11 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import tvm
-from tvm.script import tirx as T
 
+import tvm
 from tirx_harness import numsim
 from tirx_harness.numsim.transpiler.frontend import analyze
-
+from tvm.script import tirx as T
 
 _SCALAR_BITS = {
     "bool": 8,
@@ -334,7 +333,7 @@ def _identity_arguments() -> tuple[dict[str, object], dict[str, np.ndarray]]:
         suffix = _identifier(dtype)
         arguments[f"source_{suffix}"] = source
         output = np.zeros_like(source)
-        arguments[f"output_{suffix}"] = output if dtype == "bfloat16" else output
+        arguments[f"output_{suffix}"] = output
         expected[f"output_{suffix}"] = source.view(np.uint8).copy()
     return arguments, expected
 

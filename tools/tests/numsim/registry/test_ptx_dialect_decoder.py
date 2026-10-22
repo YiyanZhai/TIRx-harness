@@ -3,13 +3,9 @@ from __future__ import annotations
 import pickle
 
 import pytest
-import tvm
-from tvm import ir
-from tvm.ir import Expr
-from tvm.script import tirx as T
-from tvm.tirx import Stmt
 from tvm_ffi import structural_walk
 
+import tvm
 from tests.numsim.support.manifest import call_op_names, resolved_kernel
 from tirx_harness.numsim.transpiler.ptx_dialect import (
     PTX_SINK,
@@ -17,6 +13,10 @@ from tirx_harness.numsim.transpiler.ptx_dialect import (
     PtxCallDecodeError,
     decode_ptx_call,
 )
+from tvm import ir
+from tvm.ir import Expr
+from tvm.script import tirx as T
+from tvm.tirx import Stmt
 
 
 def _parse(source: str):
@@ -192,7 +192,7 @@ def kernel():
 
     reparsed = tvm.script.from_source(func.script(), {"T": T})
     tvm.ir.assert_structural_equal(func, reparsed)
-    reparsed_call = [call for call in _calls(reparsed, "tirx.ptx.")][0]
+    reparsed_call = next(iter(_calls(reparsed, "tirx.ptx.")))
     assert decode_ptx_call(reparsed_call).operand("d")[0] is PTX_SINK
 
 
@@ -290,7 +290,7 @@ def kernel(dst: T.handle):
 """
     )
 
-    mma_call = [call for call in _calls(func, "tirx.ptx.tcgen05_mma_")][0]
+    mma_call = next(iter(_calls(func, "tirx.ptx.tcgen05_mma_")))
     mma = decode_ptx_call(mma_call)
     assert len(mma.operand("enable_input_d")) == 1
     assert mma.predicate is None

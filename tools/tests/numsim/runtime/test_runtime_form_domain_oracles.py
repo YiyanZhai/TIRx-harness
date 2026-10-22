@@ -4,15 +4,14 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+
 import tvm
+from tests.numsim.support.runtime_domains import CUDA_LDG_DTYPES
+from tirx_harness import numsim
+from tirx_harness.numsim.dtype_abi import vector_dtype_abi
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.layout import S, TCol, TileLayout, TLane, laneid, wg_local_layout, wid_in_wg
-
-from tirx_harness import numsim
-from tirx_harness.numsim.dtype_abi import vector_dtype_abi
-from tests.numsim.support.runtime_domains import CUDA_LDG_DTYPES
-
 
 _NUMPY_SCALAR_DTYPES = {
     "float16": np.float16,
@@ -484,10 +483,10 @@ def test_cuda_ldg_complete_finite_domain_executes_with_exact_physical_oracle(tmp
     expected: dict[str, np.ndarray] = {}
     for dtype in CUDA_LDG_DTYPES:
         name = dtype.replace("_", "")
-        source, needs_binding = _storage(dtype, initialized=True)
+        source, _ = _storage(dtype, initialized=True)
         output, _ = _storage(dtype, initialized=False)
-        arguments[f"source_{name}"] = source if needs_binding else source
-        arguments[f"output_{name}"] = output if needs_binding else output
+        arguments[f"source_{name}"] = source
+        arguments[f"output_{name}"] = output
         expected[f"output_{name}"] = source.copy()
 
     result = numsim.Engine(max_workers=1).run(module, arguments)

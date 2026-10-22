@@ -17,6 +17,7 @@ from ...benchmark_common import (
     rand_tensor,
     run_benchmark,
 )
+
 TASK_NAME = "moe"
 
 ATOL = 1.0

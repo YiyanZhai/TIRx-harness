@@ -97,8 +97,6 @@ target-version = "py310"
 extend-exclude = [
   "skills/tirx-wiki/references/repos/",
   "tirx-kernels/",
-  "evolution/benchmark/",
-  "evolution/remote/",
 ]
 
 [tool.ruff.lint]
@@ -114,6 +112,7 @@ ignore = [
   "UP028", # yield-in-for-loop
   "UP030", # format-literals
   "UP031", # printf-string-formatting
+  "UP038", # non-pep604-isinstance
   # ruff (preview rules, not yet stable)
   "RUF043", # pytest-raises-ambiguous-pattern
   "RUF059", # unused-unpacked-variable
@@ -128,15 +127,14 @@ unfixable = []
 "evolution/preparation/**/*.py" = ["E501"]
 "evolution/cli.py" = ["E501"]
 "evolution/tests/**/*.py" = ["E501"]
+"tools/tests/**/*.py" = ["E501", "F821"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["tvm", "tirx_kernels", "tirx_harness", "evolution"]
-split-on-trailing-comma = false
 
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
-skip-magic-trailing-comma = true
 line-ending = "auto"
 docstring-code-format = false
 docstring-code-line-length = "dynamic"

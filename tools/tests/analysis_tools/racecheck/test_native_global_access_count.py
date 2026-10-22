@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from tirx_harness.numsim.checkers import _run_racecheck as racecheck
+
 from tests.analysis_tools.racecheck._native_race_trace import full_direct_race_run
+from tirx_harness.numsim.checkers import _run_racecheck as racecheck
 from tvm.script import tirx as T
 
 
@@ -29,7 +30,7 @@ def native_global_read_write(source: T.Buffer((32,), "int32"), output: T.Buffer(
 def native_global_atomic_only(flag: T.Buffer((1,), "int32")):
     T.device_entry()
     _warp = T.warp_id([1])
-    lane = T.lane_id([32])
+    _lane = T.lane_id([32])
     T.evaluate(T.cuda.atomic_add(flag.ptr_to([0]), T.int32(1)))
 
 

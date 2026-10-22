@@ -1,5 +1,10 @@
 """Small source-backed TIRx kernels for transpiler tests."""
 
+from tvm.backend.cuda.tile_primitive.gemm_async.tcgen05 import (
+    sf_smem_layout,
+    sf_tmem_layout,
+)
+from tvm.backend.cuda.tile_primitive.tma_utils import SwizzleMode, mma_shared_layout
 from tvm.ir.type import PointerType, PrimType
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
@@ -16,12 +21,6 @@ from tvm.tirx.layout import (
     tmem_datapath_layout,
     wg_local_layout,
 )
-from tvm.backend.cuda.tile_primitive.gemm_async.tcgen05 import (
-    sf_smem_layout,
-    sf_tmem_layout,
-)
-from tvm.backend.cuda.tile_primitive.tma_utils import SwizzleMode, mma_shared_layout
-
 
 _TEST_SWIZZLE_LAYOUT = ComposeLayout(
     3,
@@ -1013,7 +1012,6 @@ def fp8_scale_permute_tmem_roundtrip(
     T.device_entry()
     warp = T.warp_id([4])
     lane = T.lane_id([32])
-    row = T.meta_var(warp * 32 + lane)
     dense_shared = T.alloc_buffer((128,), "uint32", scope="shared")
     permuted_shared = dense_shared.view(128, layout=_TEST_PERMUTED_SHARED_LAYOUT)
     scale_shared = dense_shared.view("float8_e8m0fnu").view(
@@ -2686,9 +2684,7 @@ def raw_tma_swizzle_to_matching_layout(swizzle_bytes):
     layout = ComposeLayout(2, swizzle_bytes.bit_length() - 5, 3, TileLayout(S[(8 * columns,)]))
 
     @T.prim_func
-    def kernel(
-        input_map: T.TensorMap(), output: T.Buffer((8, columns), "float32")
-    ):
+    def kernel(input_map: T.TensorMap(), output: T.Buffer((8, columns), "float32")):
         T.device_entry()
         _warp = T.warp_id([1])
         lane = T.lane_id([32])
@@ -2703,7 +2699,13 @@ def raw_tma_swizzle_to_matching_layout(swizzle_bytes):
             T.evaluate(
                 T.ptx[
                     "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1"
-                ](T.address_of(shared[0, 0]), T.address_of(input_map), 0, 0, T.address_of(barriers[0]))
+                ](
+                    T.address_of(shared[0, 0]),
+                    T.address_of(input_map),
+                    0,
+                    0,
+                    T.address_of(barriers[0]),
+                )
             )
             T.ptx.mbarrier.arrive.expect_tx.shared.b64(T.address_of(barriers[0]), 8 * swizzle_bytes)
             T.cuda.mbarrier_wait(T.address_of(barriers[0]), 0)

@@ -6,14 +6,13 @@ from typing import Any
 
 import numpy as np
 
+from tests.numsim.support._tirx_kernels import load_tirx_kernel
 from tirx_harness.numsim.cases import (
     ComparisonRegion,
     ComparisonSpec,
     NumSimCase,
     TensorMap,
 )
-from tests.numsim.support._tirx_kernels import load_tirx_kernel
-
 
 FP8_1D1D_NUM_SMS = 2
 bmm_fp8_rubin = load_tirx_kernel("bmm_fp8_rubin")
@@ -129,14 +128,12 @@ def prepare_fp16_bf16_case(dtype: str, M: int, N: int, K: int, seed: int = 0) ->
         b = b_f32.astype(np.float16)
         output = np.zeros((M, N), dtype=np.float16)
         expected = (a.astype(np.float32) @ b.astype(np.float32).T).astype(np.float16)
-        buffer_dtype = "float16"
     else:
         a = _float32_to_bfloat16_bits(a_f32)
         b = _float32_to_bfloat16_bits(b_f32)
         output = np.zeros((M, N), dtype=np.uint16)
         expected_f32 = _bfloat16_bits_to_float32(a) @ _bfloat16_bits_to_float32(b).T
         expected = _float32_to_bfloat16_bits(expected_f32)
-        buffer_dtype = "bfloat16"
 
     args = {
         "a": a,
@@ -1033,16 +1030,16 @@ def prepare_cudnn_dense_blockscaled_amax_case() -> NumSimCase:
 
 __all__ = [
     "FP8_1D1D_NUM_SMS",
-    "GROUPED_FP8_CONFIGS",
     "FP8_BLOCKWISE_CONFIGS",
     "FP16_BF16_CONFIGS",
+    "GROUPED_FP8_CONFIGS",
     "NVFP4_CONFIGS",
     "prepare_bmm_fp8_rubin_case",
     "prepare_cudnn_dense_blockscaled_amax_case",
-    "prepare_grouped_fp8_case",
-    "prepare_fp8_bmm_case",
     "prepare_fp8_blockwise_case",
+    "prepare_fp8_bmm_case",
     "prepare_fp16_bf16_case",
+    "prepare_grouped_fp8_case",
     "prepare_k_grouped_fp8_case",
     "prepare_m_grouped_masked_fp8_case",
     "prepare_nvfp4_case",

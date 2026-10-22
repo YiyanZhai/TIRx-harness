@@ -8,9 +8,6 @@ import torch
 
 from tests.numsim.corpus.kernels.gemm import (
     FP8_1D1D_NUM_SMS,
-    FP8_BLOCKWISE_CONFIGS as NUMSIM_CONFIGS,
-)
-from tests.numsim.corpus.kernels.gemm import (
     _e4m3fn_bits_to_float32,
     _e8m0_bits_from_exponents,
     _e8m0_bits_to_float32,
@@ -18,6 +15,9 @@ from tests.numsim.corpus.kernels.gemm import (
     _fp8_blockwise_reference,
     _pack_e8m0_scales,
     _unpack_e8m0_scales,
+)
+from tests.numsim.corpus.kernels.gemm import (
+    FP8_BLOCKWISE_CONFIGS as NUMSIM_CONFIGS,
 )
 from tests.numsim.corpus.kernels.gemm import (
     prepare_fp8_blockwise_case as prepare_numsim_case,
@@ -129,7 +129,7 @@ def test_fp8_reference_applies_one_e8m0_scale_per_128_k_values():
 def test_prepare_fp8_numsim_case_is_cpu_only_deterministic_and_full_launch(config, monkeypatch):
     module = _fp8_kernel_module()
     M, N, K = config["M"], config["N"], config["K"]
-    kernel_spec = module._spec_for({"M": M, "N": N, "K": K, "num_sms": FP8_1D1D_NUM_SMS})
+    module._spec_for({"M": M, "N": N, "K": K, "num_sms": FP8_1D1D_NUM_SMS})
     original_import = builtins.__import__
 
     def guarded_import(name, *args, **kwargs):

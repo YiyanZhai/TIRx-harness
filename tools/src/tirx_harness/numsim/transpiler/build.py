@@ -544,8 +544,9 @@ def _build_identity_mismatches(
 
 def _compiler_identity() -> dict[str, Any]:
     try:
-        import tvm
         import tvm_ffi
+
+        import tvm
         from tvm.base import _LOADED_LIBS
     except ImportError:
         return {"tvm": None}
@@ -1004,7 +1005,7 @@ pyo3 = {{ version = "={PYO3_VERSION}", features = ["extension-module"] }}
 opt-level = {profile["opt_level"]}
 codegen-units = {profile["codegen_units"]}
 {strip_line}
-"""
+"""  # noqa: E501
 
 
 def _build_environment(
