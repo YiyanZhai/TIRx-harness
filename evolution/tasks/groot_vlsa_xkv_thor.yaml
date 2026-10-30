@@ -1,0 +1,130 @@
+name: groot_vlsa_xkv_thor
+# GR00T N1.7 vl_self_attention (4 blocks) + DiT cross-KV projections on Jetson Thor, as one persistent kernel.
+workload_dir: candidates/groot/vlsa_xkv_thor
+kernel_authoring: TIRx-lite
+sota_baseline:
+  name: tensorrt_10_16_deployed_engines
+bench_timeout_s: 3600
+banned_paths: []
+spec: |
+  Implement the GR00T N1.7 action head's per-frame vision-language stage,
+  vl_self_attention (4 transformer blocks) followed by the key / value
+  projections of the DiT's 16 cross-attention blocks, for batch 1 and the
+  156 vision-language tokens of one frame on NVIDIA Jetson AGX Thor
+  (compute capability 11.0, CUDA target sm_110a) as ONE persistent kernel
+  launch (a megakernel), and beat the deployed pair of TensorRT 10.16
+  engines measured on the same Thor in the same run (vl_self_attention then
+  cross-KV, 29 + 4 kernels per call). Verify the device before compiling or
+  scoring; stop and report unless its compute capability is (11, 0).
+
+  Computation. Hidden 2048, L = 156 tokens. h = hidden_states[0] [L, 2048].
+    for block b in 0..3 (p = vlsa.b):
+      a = LN(h, p.norm1)
+      q, k, v = Lin16(p.attn1.to_q / to_k / to_v, a) [L, 2048] = 32 heads x 64
+      q' = fp16(q * c), k' = fp16(k * c), c = fp16(sqrt(0.125)) = 0.35351562
+      o = softmax(q' k'^T) v per head, unmasked over the L tokens; the
+          probabilities and o stored in fp16
+      h = h + Lin16(p.attn1.to_out.0, o)
+      f = GELU(Lin8(p.ff.net.0.proj, LN(h, p.norm3))) [L, 8192]
+      h = h + Lin8(p.ff.net.2, f)
+    for cross block j in 0..15:
+      cross_keys[j, 0] = heads(Lin8(xkv.j.to_k, h)), cross_values[j, 0] =
+      heads(Lin8(xkv.j.to_v, h)), where heads() reshapes [L, 1536] to
+      [32, L, 48] (head n holds columns 48n..48n+47).
+  LN(y, p) is LayerNorm with affine p.weight / p.bias (fp16), eps 1e-5,
+  fp16 output. Lin16(p, y) = y W^T + b with p.w fp16 [N, K] and p.b fp16.
+  Lin8(p, y) is an FP8 linear with bias: q = e4m3(clamp(y / p.sx, -448,
+  448)), out = sum_k (q p.sxd)(w p.sw) + p.b, with p.w the e4m3 weight
+  [N, K] as raw bytes, p.sw, p.sx, p.sxd fp32 scalars (sx and sxd differ in
+  their last bits) and p.b fp16 [N]. GELU is the tanh form evaluated op by
+  op in fp16, as the graph does: 0.5 y (1 + tanh(c1 (y + c0 y^3))), with
+  c0 = fp16(0.044715), c1 = fp16(0.7978845608) and every intermediate
+  rounded to fp16. The exported graphs accumulate in fp32 and store h, a,
+  every linear output, q', k', o and f in fp16. Other rounding and
+  accumulation orders are allowed within the gate.
+
+  Workloads: frame0, frame1, frame30 and frame31, four real frames of one
+  LIBERO episode (the backbone's output through the action head's vlln
+  LayerNorm, the input the pipeline feeds vl_self_attention). The model
+  files live on the GPU worker under $HF_MODEL_PATH/groot-n17-libero-c235
+  (vlsa_* files and the two engines).
+
+  Version contract: solution.py exports setup(data) -> a callable with no
+  arguments. data holds CUDA tensors:
+  - the input hidden_states [1, 156, 2048] fp16 (new values on every call in
+    deployment; read it on every call);
+  - the weights vlsa.<b>.{norm1, norm3}.{weight, bias},
+    vlsa.<b>.attn1.{to_q, to_k, to_v, to_out.0}.{w, b} (fp16),
+    vlsa.<b>.{ff.net.0.proj, ff.net.2}.{w, sw, sx, sxd, b} and
+    xkv.<j>.{to_k, to_v}.{w, sw, sx, sxd, b} (FP8; the 32 cross-KV linears
+    share one input scale); sw, sx and sxd are 0-dim fp32;
+  - the preallocated outputs cross_keys and cross_values, each
+    [16, 1, 32, 156, 48] fp16.
+  setup may compile, allocate scratch, repack weights (for example into
+  tile-contiguous layouts or one stacked cross-KV matrix) and precompute
+  from weights. Every call must overwrite both outputs and must not modify
+  inputs or weights. One call must launch exactly one kernel on
+  torch.cuda.current_stream(), without host synchronization, allocation, or
+  other streams: the harness captures it in a CUDA graph and counts the
+  graph's kernel nodes.
+
+  Author production kernels in TIRx: tirx_kernels.tirx_lite, or raw
+  TVMScript/TIRx through tvm.script.tirx, compiled for sm_110a through the
+  TIRx pipeline. Do not call TensorRT, cuBLAS, PyTorch tensor operators,
+  Triton, CUTLASS/CuTe DSL, raw CUDA, or existing solution kernels for
+  production computation. Do not change the benchmark, oracle, workloads,
+  model files, or server environment to make a candidate pass.
+
+  Correctness: the oracle is an independent PyTorch emulation of the two
+  exported graphs (fp32, TF32 off, the graphs' static FP8 quantization).
+  For each frame, both outputs must be finite, with a relative L2 error of
+  at most 0.034, 0.034, 0.030, 0.030 (cross_keys) and 0.036, 0.036, 0.032,
+  0.032 (cross_values) for frames 0, 1, 30, 31, and a max abs error of at
+  most 1.0. The relative limits are 1.4x the larger error of TensorRT and an
+  independent Triton implementation: fp16 accumulation order and FP8
+  re-quantization flips are amplified over the 4 blocks, so correct
+  implementations sit 0.019-0.025 from the oracle. Max abs errors are
+  heavy-tailed (0.23-0.34 for both implementations, 0.59 for variants that
+  only change a scale's last bits), hence the flat limit; real defects (a
+  skipped block, a causal mask, swapped keys and values) reach 6 or more.
+  The gate runs repeated calls with poisoned outputs, a call after an
+  in-place change of hidden_states (limits 0.10 / 2.0), and a check of the
+  outputs left by timing. Errors at or below the floor are not detectable
+  here (an erf GELU, unquantized FFN activations). Before deployment a
+  candidate must also pass the pipeline's 997-frame task gate.
+
+  Timing and score: the baseline and candidate graphs are replayed
+  alternately, every sample after a 128 MB read. The memory clock is warmed
+  to its maximum first. Each frame's time is the median of 3 trials x 60
+  samples, and the suite holds the machine's shared GPU timing lock.
+  Score = sum of the four TensorRT medians / sum of the four candidate
+  medians. Reference points, not the score:
+  - TensorRT takes 2.12-2.13 ms per call here.
+  - The DRAM floor is 1.45 ms: 369 MB of weights (268 MB vl_self_attention,
+    101 MB cross-KV) at 255 GB/s. The MMA work is ~0.1 ms, so this is weight
+    streaming like the LLM.
+  - The best per-op pair takes ~1.73 ms: vl_self_attention 1.20 ms (Triton
+    kernels plus a decoupled TMA engine that stages each GEMM's weights into
+    L2 within a 24 MB window, 88 % of its floor) and cross-KV 0.53 ms (one
+    persistent FP8 GEMM over the 32 stacked weights).
+  - A vl_self_attention block streams 67 MB through only 4 GEMMs; the
+    attention (~18 us) and LayerNorm (~4 us) windows leave DRAM idle unless
+    weights stream through them.
+
+  Thor:
+  - 20 SMs, 228 KB shared memory per SM, 32 MB L2, ~255 GB/s achievable TMA
+    read bandwidth (with 300-400 KB in flight chip-wide).
+  - Weights must be staged into L2 with real TMA loads well ahead of use;
+    shared-memory rings alone are far smaller than the window needed. Load
+    weights already consumed with evict_first.
+  - L2 prefetch instructions beyond about 1 MB per burst are dropped.
+  - A valid cross-CTA release compiles to MEMBAR.ALL.GPU and waits for the
+    SM's in-flight memory operations, so CTAs that publish results should
+    not have weight streams in flight.
+  - Tile-contiguous weights (one contiguous block per TMA box) lift
+    streaming from ~180 to 210-230 GB/s.
+
+  First run the baseline self-check on Thor, then establish a correct
+  candidate and save its per-frame timings. Remeasure promising candidates
+  to tell repeatable gains from noise. Do not change power or clocks during
+  the run.

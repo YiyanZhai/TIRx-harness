@@ -1,0 +1,147 @@
+name: groot_llm_prefill_thor
+# GR00T N1.7 backbone LLM (16 Qwen3 layers) prefill of one frame on Jetson Thor, as one persistent kernel.
+workload_dir: candidates/groot/llm_prefill_thor
+kernel_authoring: TIRx-lite
+sota_baseline:
+  name: tensorrt_10_16_deployed_engine
+bench_timeout_s: 3600
+banned_paths: []
+spec: |
+  Implement the GR00T N1.7 backbone LLM prefill (16 Qwen3 decoder layers,
+  batch 1, the 156 vision-language tokens of one frame) on NVIDIA Jetson
+  AGX Thor (compute capability 11.0, CUDA target sm_110a) as ONE persistent
+  kernel launch (a megakernel), and beat the deployed TensorRT 10.16 engine
+  measured on the same Thor in the same run (364 kernels per call: NVFP4 and
+  FP8 GEMMs, quantize, relayout, norm, rope, attention and elementwise
+  kernels). Verify the device before compiling or scoring; stop and report
+  unless its compute capability is (11, 0).
+
+  Computation. Hidden 2048, 16 query heads and 8 key-value heads of 128,
+  SwiGLU FFN 6144, L = 156 tokens. h = inputs_embeds[0] [L, 2048].
+    Rope tables (interleaved multimodal rope): for axis a in (t, h, w),
+      angle[a, i, j] = position_ids[a, 0, i] * rope.inv_freq[j] (fp32, j < 64).
+      Frequency pair j takes axis h if j % 3 == 1 and j < 60, axis w if
+      j % 3 == 2 and j < 60, else axis t. cos / sin = fp16(cos / sin of
+      [angle, angle]) [L, 128].
+    Deepstack rows: the first 128 token positions where visual_pos_masks is
+      true, in order.
+    for layer l in 0..15 (p = layers.l):
+      x = RMS(h, p.input_layernorm.weight)
+      q = Lin4(p.self_attn.q_proj, x) [L, 16, 128]
+      k = Lin4(p.self_attn.k_proj, x), v = Lin4(p.self_attn.v_proj, x) [L, 8, 128]
+      q = Rope(RMS(q, p.self_attn.q_norm.weight)), k = Rope(RMS(k, p.self_attn.k_norm.weight))
+          (per head; Rope(y) = y cos + cat(-y[64:], y[:64]) sin)
+      a = causal GQA attention: query head n reads key-value head n // 2,
+          softmax(q k^T * attn_scale) over keys 0..i for query i, the
+          probabilities stored in fp16; a [L, 2048]
+      h = h + Lin8(p.self_attn.o_proj, a)
+      gu = Lin4(p.mlp.gateup_proj, RMS(h, p.post_attention_layernorm.weight)) [L, 12288]
+      g, u = gu[:, :6144], gu[:, 6144:]
+      h = h + Lin8(p.mlp.down_proj, fp16(silu(g)) * u)
+      if l < 3: h[deepstack rows] += deepstack_l [128, 2048]
+    embeddings[0] = h (no final norm).
+  RMS(y, w) = fp16(w * fp16(y / sqrt(mean(y^2) + 1e-6))). Lin4(p, y) is an
+  NVFP4 W4A4 linear without bias: y' = fp16(y * p.pq) (the AWQ pre-quant
+  scale), quantized in blocks of 16 along K: s = fp8_e4m3(amax / (6 gsx))
+  (clamped to 448; s = 1 if it is 0), q = e2m1 round-to-nearest-even of
+  y' / (s gsx), saturating at 6; out = sum_k (q s gsx)(e2m1(w) sf gsw). The
+  weight p.w is e2m1 pairs [N, K/2] (even k in the low nibble), p.sf the
+  ue4m3 per-16 scales [N, K/16] as raw bytes, p.gsw and p.gsx fp32 scalars,
+  p.pq fp16 [K]. Lin8(p, y) is an FP8 linear without bias:
+  y' = fp16(y * p.pq), q = e4m3(clamp(y' / p.sx, -448, 448)),
+  out = sum_k (q p.sxd)(w p.sw), with p.w the e4m3 weight [N, K] as raw
+  bytes and p.sw, p.sx, p.sxd fp32 scalars. The exported graph accumulates
+  in fp32 and stores h, x, every linear output, q and k after the norm and
+  after rope, a and the SwiGLU product in fp16. Other rounding and
+  accumulation orders are allowed within the gate.
+
+  Workloads: frame0, frame1, frame30 and frame31, four real frames of one
+  LIBERO episode. The model files live on the GPU worker under
+  $HF_MODEL_PATH/groot-n17-libero-c235 (llm_* files).
+
+  Version contract: solution.py exports setup(data) -> a callable with no
+  arguments. data holds CUDA tensors:
+  - inputs inputs_embeds, position_ids, visual_pos_masks, deepstack_0,
+    deepstack_1 and deepstack_2 (new values on every call in deployment;
+    read them on every call), and attention_mask (all ones: one unpadded
+    sequence; it may be ignored);
+  - the weights layers.<l>.{input_layernorm, post_attention_layernorm,
+    self_attn.q_norm, self_attn.k_norm}.weight (fp16),
+    layers.<l>.{self_attn.q_proj, self_attn.k_proj, self_attn.v_proj,
+    mlp.gateup_proj}.{w, sf, gsw, gsx, pq} (NVFP4),
+    layers.<l>.{self_attn.o_proj, mlp.down_proj}.{w, sw, sx, sxd, pq}
+    (FP8), rope.inv_freq [64] fp32 and attn_scale (0-dim fp32); every
+    scale named above is a 0-dim fp32 tensor;
+  - the preallocated output embeddings [1, 156, 2048] fp16.
+  setup may compile, allocate scratch, repack weights (for example into
+  tile-contiguous layouts) and precompute from weights. Every call must
+  overwrite embeddings and must not modify inputs or weights. One call must
+  launch exactly one kernel on torch.cuda.current_stream(), without host
+  synchronization, allocation, or other streams: the harness captures it in
+  a CUDA graph and counts the graph's kernel nodes.
+
+  Author production kernels in TIRx: tirx_kernels.tirx_lite, or raw
+  TVMScript/TIRx through tvm.script.tirx, compiled for sm_110a through the
+  TIRx pipeline. Do not call TensorRT, cuBLAS, PyTorch tensor operators,
+  Triton, CUTLASS/CuTe DSL, raw CUDA, or existing solution kernels for
+  production computation. Do not change the benchmark, oracle, workloads,
+  model files, or server environment to make a candidate pass.
+
+  Correctness: the oracle is an independent PyTorch emulation of the
+  exported graph (fp32, TF32 off, ModelOpt's quantization rules). Token 0
+  is an attention sink with values up to ~15000 (rms ~400; the other tokens
+  ~4), so the gate measures error per token: e_i = ||out_i - ref_i|| /
+  ||ref_i||. Each frame's output must be finite, with mean_i e_i at most
+  0.180, 0.183, 0.178, 0.187, every e_i at most 0.9, and a whole-tensor
+  relative L2 error (which is token 0's) at most 0.024, 0.024, 0.023, 0.025
+  for frames 0, 1, 30, 31. These limits are 1.4x the larger error of
+  TensorRT and an independent Triton implementation: dynamic NVFP4
+  activation quantization flips borderline roundings and 16 layers amplify
+  them, so correct implementations sit 0.12-0.13 (mean e_i) and 0.016-0.018
+  (whole tensor) from the oracle. The gate runs repeated calls with poisoned
+  outputs, a call after an in-place change of inputs_embeds and the
+  deepstack features (mean e_i at most 0.35), a call after an in-place
+  change of position_ids and visual_pos_masks (positions permuted across
+  tokens, the visual mask moved two tokens; mean e_i at most 0.20: rope
+  tables or deepstack rows computed once in setup reach 0.29-0.42), and a
+  check of the output left by timing. Errors at or below the floor are not
+  detectable here: unquantized activations (W4A16) land below it. Before
+  deployment a candidate must also pass the pipeline's 997-frame task gate.
+
+  Timing and score: the baseline and candidate graphs are replayed
+  alternately, every sample after a 128 MB read. The memory clock is warmed
+  to its maximum first. Each frame's time is the median of 3 trials x 60
+  samples, and the suite holds the machine's shared GPU timing lock.
+  Score = sum of the four TensorRT medians / sum of the four candidate
+  medians. Reference points, not the score:
+  - TensorRT takes 5.36-5.51 ms per call here.
+  - The DRAM floor is 2.24 ms: 570.6 MB of weights and scales (302 MB
+    NVFP4, 268 MB FP8) at 255 GB/s. MMA work is 0.32 ms, so the prefill is
+    weight streaming.
+  - The best per-op chain (Triton/Gluon GEMMs chained by PDL, plus a
+    decoupled TMA engine that stages weights into L2) takes 2.42 ms.
+  - A synthetic megakernel that streams the same 571 MB in 112 dependent
+    stages took 2.36-2.47 ms with valid cross-CTA publishes, against
+    2.22 ms for the PDL chain of the same stages: the publishes cost
+    135-245 us.
+
+  Thor:
+  - 20 SMs, 228 KB shared memory per SM, 32 MB L2, ~255 GB/s achievable TMA
+    read bandwidth (with 300-400 KB in flight chip-wide).
+  - Weights must be staged into L2 with real TMA loads well ahead of use (a
+    window of ~18 MB worked best for this chain); shared-memory rings alone
+    are far smaller than that window. Load weights already consumed with
+    evict_first.
+  - L2 prefetch instructions beyond about 1 MB per burst are dropped.
+  - A valid cross-CTA release compiles to MEMBAR.ALL.GPU and waits for the
+    SM's in-flight memory operations, so CTAs that publish results should
+    not have weight streams in flight.
+  - The non-GEMM work (RMSNorm + quantization, q/k norm + rope, attention)
+    is ~30 us per layer with DRAM idle unless weights stream through it.
+  - Tile-contiguous weights (one contiguous block per TMA box) lift
+    streaming from ~180 to 210-230 GB/s.
+
+  First run the baseline self-check on Thor, then establish a correct
+  candidate and save its per-frame timings. Remeasure promising candidates
+  to tell repeatable gains from noise. Do not change power or clocks during
+  the run.

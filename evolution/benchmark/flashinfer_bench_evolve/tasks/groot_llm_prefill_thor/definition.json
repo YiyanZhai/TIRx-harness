@@ -1,0 +1,43 @@
+{
+  "name": "groot_llm_prefill_thor",
+  "description": "GR00T N1.7 backbone LLM prefill on Jetson Thor: 16 Qwen3 layers (NVFP4 q/k/v/gate_up, FP8 o/down, q/k RMSNorm, interleaved mrope, causal GQA 16/8 x 128, deepstack after layers 0-2) on the 156 vision-language tokens of one frame, against the deployed TensorRT 10.16 engine.",
+  "op_type": "transformer_prefill",
+  "tags": [
+    "dtype:nvfp4",
+    "dtype:fp8",
+    "dtype:fp16",
+    "status:real",
+    "device:jetson_thor_sm110",
+    "baseline:tensorrt"
+  ],
+  "axes": {
+    "frame": {"type": "const", "values": [0, 1, 30, 31]},
+    "tokens": {"type": "const", "value": 156},
+    "layers": {"type": "const", "value": 16}
+  },
+  "inputs": {
+    "inputs_embeds": {"shape": [1, 156, 2048], "dtype": "float16"},
+    "attention_mask": {"shape": [1, 156], "dtype": "int64"},
+    "position_ids": {"shape": [3, 1, 156], "dtype": "int64"},
+    "visual_pos_masks": {"shape": [1, 156], "dtype": "bool"},
+    "deepstack_0": {"shape": [128, 2048], "dtype": "float16"},
+    "deepstack_1": {"shape": [128, 2048], "dtype": "float16"},
+    "deepstack_2": {"shape": [128, 2048], "dtype": "float16"},
+    "layers.<l>.<norm>.weight": {"shape": ["2048 or 128"], "dtype": "float16"},
+    "layers.<l>.<nvfp4 linear>.w": {"shape": ["N", "K/2"], "dtype": "uint8"},
+    "layers.<l>.<nvfp4 linear>.sf": {"shape": ["N", "K/16"], "dtype": "uint8 (ue4m3 bytes)"},
+    "layers.<l>.<nvfp4 linear>.gsw": {"shape": [], "dtype": "float32"},
+    "layers.<l>.<nvfp4 linear>.gsx": {"shape": [], "dtype": "float32"},
+    "layers.<l>.<linear>.pq": {"shape": ["K"], "dtype": "float16"},
+    "layers.<l>.<fp8 linear>.w": {"shape": ["N", "K"], "dtype": "uint8 (e4m3 bytes)"},
+    "layers.<l>.<fp8 linear>.sw": {"shape": [], "dtype": "float32"},
+    "layers.<l>.<fp8 linear>.sx": {"shape": [], "dtype": "float32"},
+    "layers.<l>.<fp8 linear>.sxd": {"shape": [], "dtype": "float32"},
+    "rope.inv_freq": {"shape": [64], "dtype": "float32"},
+    "attn_scale": {"shape": [], "dtype": "float32"}
+  },
+  "outputs": {
+    "embeddings": {"shape": [1, 156, 2048], "dtype": "float16"}
+  },
+  "reference": "from flashinfer_bench_evolve.tasks.groot_llm_prefill_thor.baseline import reference as run\n"
+}

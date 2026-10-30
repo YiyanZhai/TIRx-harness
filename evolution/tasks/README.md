@@ -318,3 +318,86 @@ candidate must also pass the pipeline's task-level gate.
 ```bash
 python evolution/remote/kcoral_remote.py groot/dit_step_thor baseline --remote http://127.0.0.1:8901
 ```
+
+## GR00T N1.7 LLM prefill on Jetson Thor
+
+`groot_llm_prefill_thor` (workload `groot/llm_prefill_thor`) scores the
+prefill of the GR00T N1.7 backbone LLM on Jetson AGX Thor (sm_110a): 16
+Qwen3 layers on the 156 vision-language tokens of one frame. q / k / v and
+gate_up are NVFP4 W4A4, o and down are FP8; the layers also do per-head
+q/k RMSNorm, interleaved multimodal rope and causal GQA (16 / 8 heads x
+128), and add the deepstack features after layers 0-2. The task requires one
+persistent kernel per call. The four rows are four real frames of one
+LIBERO episode. TensorRT runs 364 kernels and takes 5.36-5.51 ms per call
+here. The DRAM floor is 2.24 ms (571 MB of weights at 255 GB/s).
+
+The model files (`llm_nvfp4.engine`, `llm_weights.safetensors`,
+`llm_golden.safetensors`, `llm_manifest.json`) sit in the same
+`groot-n17-libero-c235` directory as the other GR00T tasks. They are built
+by `kda/tirx/m3_prepare.py` in groot-perf-diagnosis. The task imports the
+action-head task's timing, lock and graph helpers.
+
+The gate measures error per token. Token 0 is an attention sink (values up
+to ~15000, rms ~400 against ~4 for the other tokens), so a whole-tensor
+relative L2 only measures that token. The primary check is the mean over
+tokens of each token's relative L2. TensorRT and an independent Triton
+implementation sit 0.12-0.13 from the oracle on it, because NVFP4
+quantization flips are amplified over 16 layers. Each frame allows 1.4x the
+larger of the two (and 1.4x their whole-tensor error, 0.9 for any single
+token). Two probes change the inputs in place: new embeddings and deepstack
+values (limit 0.35), and a new token layout with positions permuted and the
+visual mask moved (limit 0.20). Controls (`kda/tirx/m3_controls/`):
+
+| control | per-token mean vs the oracle | verdict |
+| --- | --- | --- |
+| TensorRT (baseline) | 0.127-0.133 | PASS |
+| layer 15 skipped | 0.31-0.32 | FAIL |
+| deepstack features not added | 0.29-0.30 | FAIL |
+| rope sections contiguous instead of interleaved | 0.19-0.20 | FAIL (narrowly) |
+| output cached in setup | 0.47-0.48 after the value probe | FAIL |
+| rope tables and deepstack rows from setup | 0.42 after the layout probe | FAIL |
+| rope tables from setup | 0.26-0.28 after the layout probe | FAIL |
+| activations not quantized (W4A16) | below the floor | passes, then the one-kernel check |
+| correct PyTorch implementation | passes, then 3652 kernels | FAIL (one-kernel check) |
+
+```bash
+python evolution/remote/kcoral_remote.py groot/llm_prefill_thor baseline --remote http://127.0.0.1:8901
+```
+
+## GR00T N1.7 vl_self_attention + cross-KV on Jetson Thor
+
+`groot_vlsa_xkv_thor` (workload `groot/vlsa_xkv_thor`) scores the action
+head's per-frame vision-language stage on Jetson AGX Thor (sm_110a):
+vl_self_attention (4 transformer blocks on the 156 tokens: fp16 attention
+projections, FP8 GELU FFN) and the keys and values of the DiT's 16
+cross-attention blocks (32 FP8 linears). The task requires one persistent
+kernel per call. The four rows are four real frames (the LLM task's golden
+outputs through the action head's `vlln` LayerNorm). The baseline is the
+deployed pair of engines back to back: 29 + 4 kernels, 2.12-2.13 ms per call
+here. The DRAM floor is 1.45 ms (369 MB of weights).
+
+The model files (`vl_self_attention.engine`, `dit_cross_kv.engine`,
+`vlsa_weights.safetensors`, `vlsa_golden.safetensors`,
+`vlsa_manifest.json`) are built by `kda/tirx/m4_prepare.py`. The live
+engines reproduce a dumped pipeline call bit for bit.
+
+The gate sits at the noise floor of the 4 blocks: TensorRT and an
+independent Triton implementation differ from the oracle by 0.019-0.025
+relative L2 on the keys and values. Each frame allows 1.4x the larger, per
+output. The max abs error is heavy-tailed (a change in the last bits of one
+scale reaches 0.59), so its limit is a flat 1.0. Controls
+(`kda/tirx/m4_controls/`):
+
+| control | relative L2 vs the oracle | verdict |
+| --- | --- | --- |
+| TensorRT (baseline) | 0.021-0.025 | PASS |
+| block 3 skipped | 0.57-0.58 | FAIL |
+| causal attention mask | 0.60-0.70 | FAIL |
+| keys and values swapped | 1.31-1.32 | FAIL |
+| outputs cached in setup | 0.27-0.29 after the input change | FAIL |
+| erf GELU instead of tanh | below the floor | passes, then the one-kernel check |
+| correct PyTorch implementation | passes, then 678 kernels | FAIL (one-kernel check) |
+
+```bash
+python evolution/remote/kcoral_remote.py groot/vlsa_xkv_thor baseline --remote http://127.0.0.1:8901
+```

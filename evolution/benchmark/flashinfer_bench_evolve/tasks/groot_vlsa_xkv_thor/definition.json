@@ -1,0 +1,34 @@
+{
+  "name": "groot_vlsa_xkv_thor",
+  "description": "GR00T N1.7 vl_self_attention (4 blocks: fp16 attention projections, FP8 GELU FFN) plus the DiT cross-KV projections (32 FP8 linears) on the 156 vision-language tokens of one frame on Jetson Thor, against the deployed pair of TensorRT 10.16 engines.",
+  "op_type": "transformer_blocks",
+  "tags": [
+    "dtype:fp8",
+    "dtype:fp16",
+    "status:real",
+    "device:jetson_thor_sm110",
+    "baseline:tensorrt"
+  ],
+  "axes": {
+    "frame": {"type": "const", "values": [0, 1, 30, 31]},
+    "tokens": {"type": "const", "value": 156},
+    "blocks": {"type": "const", "value": 4}
+  },
+  "inputs": {
+    "hidden_states": {"shape": [1, 156, 2048], "dtype": "float16"},
+    "vlsa.<b>.<norm>.weight": {"shape": [2048], "dtype": "float16"},
+    "vlsa.<b>.<norm>.bias": {"shape": [2048], "dtype": "float16"},
+    "vlsa.<b>.attn1.<linear>.w": {"shape": [2048, 2048], "dtype": "float16"},
+    "vlsa.<b>.attn1.<linear>.b": {"shape": [2048], "dtype": "float16"},
+    "<fp8 linear>.w": {"shape": ["N", "K"], "dtype": "uint8 (e4m3 bytes)"},
+    "<fp8 linear>.sw": {"shape": [], "dtype": "float32"},
+    "<fp8 linear>.sx": {"shape": [], "dtype": "float32"},
+    "<fp8 linear>.sxd": {"shape": [], "dtype": "float32"},
+    "<fp8 linear>.b": {"shape": ["N"], "dtype": "float16"}
+  },
+  "outputs": {
+    "cross_keys": {"shape": [16, 1, 32, 156, 48], "dtype": "float16"},
+    "cross_values": {"shape": [16, 1, 32, 156, 48], "dtype": "float16"}
+  },
+  "reference": "from flashinfer_bench_evolve.tasks.groot_vlsa_xkv_thor.baseline import reference as run\n"
+}
