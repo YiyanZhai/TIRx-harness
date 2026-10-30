@@ -260,7 +260,19 @@ Each timing sample follows a 128 MB read, so the weights start in DRAM as
 they do after a DiT step. The memory clock is warmed to its maximum before
 timing. Baseline and candidate graph replays alternate sample by sample.
 
+The GPU worker is the kcoral server on the Thor, which listens on the
+Thor's 127.0.0.1:8901 only. The uv workspace resolves on Linux x86_64 only,
+so the agent machine is an x86_64 host that reaches the server through an
+SSH tunnel; all GPU work then runs on the Thor:
+
 ```bash
+ssh -N -L 8901:127.0.0.1:8901 <thor-host> &
 uv run --package tirx-evolution evolve init --task groot_ah_boundary_thor --remote http://127.0.0.1:8901
 python evolution/remote/kcoral_remote.py groot/ah_boundary_thor baseline --remote http://127.0.0.1:8901
 ```
+
+TIRx-lite code written for B200 runs on sm_110a after retargeting
+(`TIRX_PREPARE_CUDA_ARCH=sm_110a`): tirx-kernels' tcgen05 fp16 GEMM and
+NVFP4 block-scaled GEMM, including 2-SM clusters and TMA multicast, pass on
+the Thor unchanged except for the target and the persistent grid size (20
+SMs). Tile, grid and pipeline tuning do not carry over.
