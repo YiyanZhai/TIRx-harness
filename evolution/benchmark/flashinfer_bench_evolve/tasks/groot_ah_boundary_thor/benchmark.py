@@ -342,17 +342,21 @@ def _run_row(k, weights, golden, device, cfg, candidate_fn, candidate_prepare_fn
     _check(alias_data, alias_expected, "in place (actions_out is actions_in)")
     checks += 2
 
+    graphs = {}  # destroyed before the engines and modules whose kernels they captured
     try:
-        base_graph, base_kernels = _graph(base, stream)
-        cand_graph, cand_kernels = _graph(candidate, stream)
-    except RuntimeError as exc:
-        raise AssertionError(f"CUDA graph capture failed: {exc}") from exc
-    if candidate_fn is not None and cand_kernels != 1:
-        raise AssertionError(
-            f"one call launched {cand_kernels} kernels; the contract is one persistent kernel"
-        )
-    graphs = {"baseline": base_graph, "candidate": cand_graph}
-    samples = _time(graphs, cfg, flush)
+        try:
+            graphs["baseline"], base_kernels = _graph(base, stream)
+            graphs["candidate"], cand_kernels = _graph(candidate, stream)
+        except RuntimeError as exc:
+            raise AssertionError(f"CUDA graph capture failed: {exc}") from exc
+        if candidate_fn is not None and cand_kernels != 1:
+            raise AssertionError(
+                f"one call launched {cand_kernels} kernels; the contract is one persistent kernel"
+            )
+        samples = _time(graphs, cfg, flush)
+    finally:
+        graphs.clear()
+        torch.cuda.synchronize()
     if cfg.check_after_timing:
         _check(data, expected, "outputs left by timing")
         checks += 1

@@ -276,3 +276,45 @@ TIRx-lite code written for B200 runs on sm_110a after retargeting
 NVFP4 block-scaled GEMM, including 2-SM clusters and TMA multicast, pass on
 the Thor unchanged except for the target and the persistent grid size (20
 SMs). Tile, grid and pipeline tuning do not carry over.
+
+## GR00T N1.7 DiT step on Jetson Thor
+
+`groot_dit_step_thor` (workload `groot/dit_step_thor`) scores one denoising
+step of the GR00T N1.7 DiT on Jetson AGX Thor (sm_110a). The step is 32
+NVFP4 W4A4 transformer blocks on 41 tokens, alternating cross- and
+self-attention, plus the output head. The task requires one persistent
+kernel per call: the harness counts the kernel nodes of the captured
+candidate graph. The four rows are the four steps of one real LIBERO frame,
+and the score is the sum of the TensorRT medians divided by the sum of the
+candidate medians. TensorRT runs 516 kernels and takes 3.86-3.89 ms per step
+here. The DRAM floor is 1.90 ms.
+
+The model files (`dit_nvfp4.engine`, `dit_weights.safetensors`,
+`dit_golden.safetensors`, `dit_manifest.json`) sit in the same
+`groot-n17-libero-c235` directory as the action-head task. They are built by
+`kda/tirx/m2_prepare.py` in groot-perf-diagnosis. The worker requirements,
+timing protocol and lock are the action-head task's: the task imports that
+task's helpers, so both packages travel together.
+
+The correctness gate sits at the NVFP4 noise floor. Dynamic activation
+quantization flips borderline roundings, so TensorRT and an independent
+Triton implementation both differ from the PyTorch oracle by 0.026-0.049
+relative L2 per step. Each step allows 1.4x the larger of the two in
+relative L2 and 2x in max abs error. Controls:
+
+| control | per-step relative L2 vs the oracle | verdict |
+| --- | --- | --- |
+| TensorRT (baseline) | 0.027 / 0.033 / 0.038 / 0.048 | PASS |
+| cross-attention masks swapped | 0.36-0.89 | FAIL |
+| block 31 skipped | 0.11-0.21 | FAIL |
+| activations not quantized (W4A16) | 0.062-0.076 | FAIL |
+| output cached in setup | caught by the in-place input change | FAIL |
+| correct PyTorch implementation | passes, then 6415 kernels | FAIL (one-kernel check) |
+
+Defects below the floor, such as a missing bias in one block or a wrong
+epsilon, are not detectable from the step output. Before deployment a
+candidate must also pass the pipeline's task-level gate.
+
+```bash
+python evolution/remote/kcoral_remote.py groot/dit_step_thor baseline --remote http://127.0.0.1:8901
+```

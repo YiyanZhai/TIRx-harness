@@ -1,0 +1,35 @@
+{
+  "name": "groot_dit_step_thor",
+  "description": "GR00T N1.7 DiT, one denoising step on Jetson Thor: 32 NVFP4 W4A4 transformer blocks (alternating cross- and self-attention) on 41 tokens plus the output head, against the deployed TensorRT 10.16 engine.",
+  "op_type": "transformer_step",
+  "tags": [
+    "dtype:nvfp4",
+    "dtype:fp16",
+    "status:real",
+    "device:jetson_thor_sm110",
+    "baseline:tensorrt"
+  ],
+  "axes": {
+    "step": {"type": "const", "values": [0, 1, 2, 3]},
+    "tokens": {"type": "const", "value": 41},
+    "blocks": {"type": "const", "value": 32}
+  },
+  "inputs": {
+    "sa_embs": {"shape": [1, 41, 1536], "dtype": "float16"},
+    "cross_keys": {"shape": [16, 1, 32, 156, 48], "dtype": "float16"},
+    "cross_values": {"shape": [16, 1, 32, 156, 48], "dtype": "float16"},
+    "adaln_modulations": {"shape": [32, 1, 3072], "dtype": "float16"},
+    "output_modulation": {"shape": [1, 3072], "dtype": "float16"},
+    "image_mask": {"shape": [1, 156], "dtype": "bool"},
+    "backbone_attention_mask": {"shape": [1, 156], "dtype": "bool"},
+    "blocks.<i>.<linear>.w": {"shape": ["N", "K/2"], "dtype": "uint8"},
+    "blocks.<i>.<linear>.sf": {"shape": ["N", "K/16"], "dtype": "uint8 (ue4m3 bytes)"},
+    "blocks.<i>.<linear>.b": {"shape": ["N"], "dtype": "float16"},
+    "blocks.<i>.<linear>.gsw": {"shape": [], "dtype": "float32"},
+    "blocks.<i>.<linear>.gsx": {"shape": [], "dtype": "float32"}
+  },
+  "outputs": {
+    "output": {"shape": [1, 41, 1024], "dtype": "float16"}
+  },
+  "reference": "from flashinfer_bench_evolve.tasks.groot_dit_step_thor.baseline import reference as run\n"
+}

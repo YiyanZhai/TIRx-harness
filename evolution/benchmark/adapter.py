@@ -51,6 +51,7 @@ PACKAGED = {
     "gdn/decode": ("gdn_decode", 10, 50, "all"),
     "gdn/prefill": ("gdn_prefill", 10, 50, "all"),
     "groot/ah_boundary_thor": ("groot_ah_boundary_thor", 20, 100, "all"),
+    "groot/dit_step_thor": ("groot_dit_step_thor", 10, 60, "all"),
     "grouped_gemm/fp8": ("grouped_gemm_fp8", 3, 30, "all"),
     "kda/decode": ("kda_decode", 3, 50, "all"),
     "kda/decode_b128_t1_h16_hv32_d128_bf16": ("kda_decode", 3, 50, "pinned"),
