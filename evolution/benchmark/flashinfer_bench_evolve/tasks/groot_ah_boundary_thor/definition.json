@@ -1,0 +1,39 @@
+{
+  "name": "groot_ah_boundary_thor",
+  "description": "GR00T N1.7 action head, one denoising-step boundary on Jetson Thor: action decoder, Euler update, action encoder, position embedding and sa_embs concatenation, against the deployed TensorRT 10.16 engines.",
+  "op_type": "fused_mlp_chain",
+  "tags": [
+    "dtype:fp16",
+    "status:real",
+    "device:jetson_thor_sm110",
+    "baseline:tensorrt"
+  ],
+  "axes": {
+    "boundary": {"type": "const", "values": [0, 1, 2]},
+    "tokens": {"type": "const", "value": 41},
+    "horizon": {"type": "const", "value": 40}
+  },
+  "inputs": {
+    "x": {"shape": [1, 41, 1024], "dtype": "float16"},
+    "actions_in": {"shape": [1, 40, 132], "dtype": "float16"},
+    "timestep_embedding": {"shape": [1, 40, 1536], "dtype": "float16"},
+    "state_features": {"shape": [1, 1, 1536], "dtype": "float16"},
+    "position_embedding": {"shape": [1, 40, 1536], "dtype": "float16"},
+    "embodiment_id": {"shape": [1], "dtype": "int64"},
+    "L1": {"shape": [1024, 1024], "dtype": "float16"},
+    "c1": {"shape": [1024], "dtype": "float16"},
+    "L2": {"shape": [132, 1024], "dtype": "float16"},
+    "c2": {"shape": [132], "dtype": "float16"},
+    "W1": {"shape": [1536, 132], "dtype": "float16"},
+    "b1": {"shape": [1536], "dtype": "float16"},
+    "W2": {"shape": [1536, 3072], "dtype": "float16"},
+    "b2": {"shape": [1536], "dtype": "float16"},
+    "W3": {"shape": [1536, 1536], "dtype": "float16"},
+    "b3": {"shape": [1536], "dtype": "float16"}
+  },
+  "outputs": {
+    "actions_out": {"shape": [1, 40, 132], "dtype": "float16"},
+    "sa_embs": {"shape": [1, 41, 1536], "dtype": "float16"}
+  },
+  "reference": "from flashinfer_bench_evolve.tasks.groot_ah_boundary_thor.baseline import reference as run\n"
+}

@@ -1,0 +1,100 @@
+name: groot_ah_boundary_thor
+# GR00T N1.7 action head, one denoising-step boundary on Jetson Thor, as one persistent kernel.
+workload_dir: candidates/groot/ah_boundary_thor
+kernel_authoring: TIRx-lite
+sota_baseline:
+  name: tensorrt_10_16_deployed_engines
+bench_timeout_s: 3600
+banned_paths: []
+spec: |
+  Implement one denoising-step boundary of the GR00T N1.7 action head
+  (batch 1) on NVIDIA Jetson AGX Thor (compute capability 11.0, CUDA target
+  sm_110a) as ONE persistent kernel launch (a megakernel), and beat the
+  deployed TensorRT sequence measured on the same Thor in the same run: the
+  TensorRT 10.16 action-decoder and action-encoder engines (fp16 weights,
+  fp32 accumulation) plus the runtime's PyTorch glue, about 13 kernels,
+  captured in one CUDA graph. Verify the device before compiling or scoring;
+  stop and report unless its compute capability is (11, 0).
+
+  Computation. Weights are fp16 in nn.Linear layout [out, in]; dt = 0.25;
+  the weights belong to embodiment 2.
+    h1          = relu(x[0] @ L1^T + c1)                        [41, 1024]
+    prediction  = h1 @ L2^T + c2                                [41, 132]
+    actions_out = actions_in[0] + dt * prediction[1:41]          [40, 132]
+    a           = actions_out @ W1^T + b1                       [40, 1536]
+    z           = cat(a, timestep_embedding[0], dim=1) @ W2^T + b2
+    features    = silu(z) @ W3^T + b3                           [40, 1536]
+    sa_embs[0]  = cat(state_features[0], features + position_embedding[0])
+  If embodiment_id[0] != 2, prediction and features are NaN, so actions_out
+  and sa_embs rows 1..40 are NaN; row 0 is still state_features. The
+  exported graph accumulates in fp32 and stores h1, prediction, actions_out,
+  a, z, silu(z), features and sa_embs in fp16; other rounding and
+  reassociation are allowed within the correctness gate.
+
+  Workloads: boundary0, boundary1 and boundary2, the three boundaries
+  between the four DiT steps of one real LIBERO frame (x is the DiT output of
+  step k, actions_in the actions after the previous update, and
+  timestep_embedding the constant of step k+1; its 40 rows are identical).
+  The model files live on the GPU worker under
+  $HF_MODEL_PATH/groot-n17-libero-c235.
+
+  Version contract: solution.py exports setup(data) -> a callable with no
+  arguments. data holds CUDA tensors named as above: inputs x, actions_in,
+  state_features and embodiment_id (new values on every call in deployment;
+  read them on every call), timestep_embedding and position_embedding
+  (constants of this boundary), weights L1, c1, L2, c2, W1, b1, W2, b2, W3,
+  b3, preallocated outputs actions_out and sa_embs, and Python scalars dt
+  and embodiment. actions_out may be the same tensor as actions_in (the
+  deployed in-place update); results must be correct then too. setup may
+  compile, allocate scratch, prepack weights, and precompute from weights
+  and the two constants (for example, W2's timestep half is one fixed
+  vector per boundary). Every call must overwrite all of actions_out and
+  sa_embs and must not modify inputs or weights. One call must launch
+  exactly one kernel on torch.cuda.current_stream(), without host
+  synchronization, allocation, or other streams: the harness captures it in
+  a CUDA graph and counts the graph's kernel nodes.
+
+  Author production kernels in TIRx: tirx_kernels.tirx_lite, or raw
+  TVMScript/TIRx through tvm.script.tirx, compiled for sm_110a through the
+  TIRx pipeline. Do not call TensorRT, cuBLAS, PyTorch tensor operators,
+  Triton, CUTLASS/CuTe DSL, raw CUDA, or existing solution kernels for
+  production computation. Do not change the benchmark, oracle, workloads,
+  model files, or server environment to make a candidate pass.
+
+  Correctness: an independent float64 oracle with fp16 storage at the points
+  above. Both outputs must be finite with every element within
+  |out - ref| <= 0.02 + 0.01 |ref| and a relative RMS error <= 2e-3. The
+  gate runs repeated calls with poisoned outputs, a call after an in-place
+  change of x, actions_in and state_features, the embodiment guard, a call
+  with actions_out aliasing actions_in, and a check of the outputs left by
+  timing. The TensorRT baseline passes the same gate (1 fp16 ulp from the
+  oracle).
+
+  Timing and score: the baseline and candidate graphs are replayed
+  alternately; every sample follows a 128 MB read, so weights start cold in
+  DRAM as they do after a DiT step. The memory clock is warmed to its
+  maximum first. Each boundary's time is the median of 3 trials x 100
+  samples, and the suite holds the machine's shared GPU timing lock. Score
+  = sum of the three TensorRT medians / sum of the three candidate medians.
+  Reference points, not the score: TensorRT measures 130-133 us per
+  boundary in this benchmark (13 kernels; 153 us under nsys inside the
+  pipeline); a 4-kernel Triton chain takes 50-60 us in the pipeline; the
+  DRAM floor is about 47 us for the ~12 MB a boundary must read at 255 GB/s
+  with W2's timestep half folded (66 us for all 16.8 MB). In two baseline
+  self-checks (TensorRT in both arms) per-boundary ratios ranged
+  0.97-1.04 and the aggregate 0.98-1.00, so differences within about 4 %
+  per boundary are measurement noise.
+
+  Thor: 20 SMs, 228 KB shared memory per SM, 32 MB L2, ~255 GB/s achievable
+  TMA read bandwidth, ~1.35 TB/s L2 bandwidth. A valid cross-CTA release
+  compiles to MEMBAR.ALL.GPU and waits for the SM's in-flight memory
+  operations, so CTAs that publish results should not have weight streams in
+  flight. L2 prefetch instructions beyond about 1 MB per burst are dropped;
+  stage weights with real (TMA) loads. In the pipeline, weights loaded
+  without evict_first displace data the next DiT step reuses (not scored
+  here).
+
+  First run the baseline self-check on Thor, then establish a correct
+  candidate and save its per-boundary timings. Remeasure promising
+  candidates to tell repeatable gains from noise. Do not change power or
+  clocks during the run.

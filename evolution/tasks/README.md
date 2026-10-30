@@ -218,3 +218,49 @@ are not compared to the single-step reference. `BENCH_TRIALS` defaults to 1;
 additional trials reverse implementation order and restore before every block.
 Baseline self-checks use the reference in both blocks. Prefix preparation,
 snapshots, transfers and correctness checks remain outside the GPU score.
+
+## GR00T N1.7 action-head boundary on Jetson Thor
+
+`groot_ah_boundary_thor` (workload `groot/ah_boundary_thor`) scores one
+denoising-step boundary of the GR00T N1.7 action head on Jetson AGX Thor
+(sm_110a). The boundary is the action decoder, the Euler update, the action
+encoder for the next step, the position embedding and the `sa_embs`
+concatenation. The task requires one persistent kernel per call: the
+harness counts the kernel nodes of the captured candidate graph. The three
+rows are the three boundaries of one real LIBERO frame, and the score is
+the sum of the TensorRT medians divided by the sum of the candidate medians.
+
+The baseline is the deployed sequence: the pipeline's TensorRT 10.16.1.11
+action-decoder and action-encoder engines plus the GR00T runtime's PyTorch
+glue, captured in one CUDA graph and timed in the same run. The oracle is an
+independent float64 implementation with the exported graph's fp16 storage
+points. The baseline is 1 fp16 ulp from it.
+
+These tasks follow the [model weights convention](#model-weights):
+
+| Model setting | Value |
+| --- | --- |
+| Subdirectory | `groot-n17-libero-c235` |
+| Source | no download; built by `kda/tirx/m1_prepare.py` in groot-perf-diagnosis |
+| Files | `action_decoder.engine`, `action_encoder.engine`, `weights.safetensors`, `golden.safetensors`, `manifest.json` (SHA-256 of the others) |
+
+The GPU worker needs:
+- TensorRT 10.16 Python bindings. `GROOT_TRT_SITE` names a side-by-side
+  site directory, default `/opt/trt-10.16.1/site`.
+- `safetensors` and `cuda.bindings`.
+- Optionally, a shared GPU timing lock. `GROOT_GPU_LOCK` defaults to
+  `/sources/.thor-gpu-timing.lock`; the suite skips the lock if the file does
+  not exist. Otherwise it holds the lock for the whole run. It waits for the
+  lock at most `GROOT_GPU_LOCK_WAIT_S` (default 2700 s, inside the task's
+  3600 s budget), then fails with a clear error. Do not hold the same lock
+  around a remote request on the client side, or the worker waits on its own
+  client.
+
+Each timing sample follows a 128 MB read, so the weights start in DRAM as
+they do after a DiT step. The memory clock is warmed to its maximum before
+timing. Baseline and candidate graph replays alternate sample by sample.
+
+```bash
+uv run --package tirx-evolution evolve init --task groot_ah_boundary_thor --remote http://127.0.0.1:8901
+python evolution/remote/kcoral_remote.py groot/ah_boundary_thor baseline --remote http://127.0.0.1:8901
+```
