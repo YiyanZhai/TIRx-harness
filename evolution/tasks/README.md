@@ -241,7 +241,7 @@ These tasks follow the [model weights convention](#model-weights):
 | Model setting | Value |
 | --- | --- |
 | Subdirectory | `groot-n17-libero-c235` |
-| Source | no download; built by `kda/tirx/m1_prepare.py` in groot-perf-diagnosis |
+| Source | no download; built by `kda/tirx/m1_prepare.py` in groot-perf-diagnosis (a private repository on the Thor; the worker already holds the files) |
 | Files | `action_decoder.engine`, `action_encoder.engine`, `weights.safetensors`, `golden.safetensors`, `manifest.json` (SHA-256 of the others) |
 
 The GPU worker needs:
@@ -263,10 +263,11 @@ timing. Baseline and candidate graph replays alternate sample by sample.
 The GPU worker is the kcoral server on the Thor, which listens on the
 Thor's 127.0.0.1:8901 only. The uv workspace resolves on Linux x86_64 only,
 so the agent machine is an x86_64 host that reaches the server through an
-SSH tunnel; all GPU work then runs on the Thor:
+SSH tunnel; all GPU work then runs on the Thor. The step-by-step runbook,
+with a goal prompt for each task, is [groot_thor_runbook.md](groot_thor_runbook.md):
 
 ```bash
-ssh -N -L 8901:127.0.0.1:8901 <thor-host> &
+ssh -N -L 8901:127.0.0.1:8901 yiyanz@catalyst-thor &
 uv run --package tirx-evolution evolve init --task groot_ah_boundary_thor --remote http://127.0.0.1:8901
 python evolution/remote/kcoral_remote.py groot/ah_boundary_thor baseline --remote http://127.0.0.1:8901
 ```
@@ -278,7 +279,9 @@ the Thor unchanged except for the target and the persistent grid size (20
 SMs). Tile, grid and pipeline tuning do not carry over. The kcoral worker on
 the Thor exports `TIRX_PREPARE_CUDA_ARCH=sm_110a`; without it, tcgen05 kernels
 traced with the B200 default `arch="sm_100a"` fail with
-`CUDA_ERROR_NO_BINARY_FOR_GPU`.
+`CUDA_ERROR_NO_BINARY_FOR_GPU`. IKET on the Thor needs `run-iket` from
+nvidia-cutlass-dsl 4.8 or later (4.7.0 has no sm110 trace support); the
+worker provides it, as the runbook describes.
 
 ## GR00T N1.7 DiT step on Jetson Thor
 
