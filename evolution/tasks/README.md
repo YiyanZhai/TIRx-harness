@@ -275,7 +275,10 @@ TIRx-lite code written for B200 runs on sm_110a after retargeting
 (`TIRX_PREPARE_CUDA_ARCH=sm_110a`): tirx-kernels' tcgen05 fp16 GEMM and
 NVFP4 block-scaled GEMM, including 2-SM clusters and TMA multicast, pass on
 the Thor unchanged except for the target and the persistent grid size (20
-SMs). Tile, grid and pipeline tuning do not carry over.
+SMs). Tile, grid and pipeline tuning do not carry over. The kcoral worker on
+the Thor exports `TIRX_PREPARE_CUDA_ARCH=sm_110a`; without it, tcgen05 kernels
+traced with the B200 default `arch="sm_100a"` fail with
+`CUDA_ERROR_NO_BINARY_FOR_GPU`.
 
 ## GR00T N1.7 DiT step on Jetson Thor
 
