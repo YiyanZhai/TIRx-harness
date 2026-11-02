@@ -16,6 +16,14 @@ Racecheck build a Rust crate, see `docs/installation.md`; the M1 run's machine h
 them), and SSH access to the Thor (`yiyanz@catalyst-thor`, 192.168.10.117 on the lab LAN). Add the agent
 machine's public key to the Thor's `~/.ssh/authorized_keys`.
 
+`evolve init` also compiles the harness's native tools with Cargo, and on Rust 1.79 it fails. Install a newer
+toolchain at user level with rustup. To keep it off a full home disk, set `RUSTUP_HOME` and `CARGO_HOME` first:
+
+```bash
+rustup toolchain install stable --profile minimal && rustup default stable
+rustc --version    # 1.89.0 or later
+```
+
 ```bash
 git clone -b groot-ah-boundary-thor git@github.com:YiyanZhai/TIRx-harness.git
 cd TIRx-harness
