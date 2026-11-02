@@ -246,26 +246,27 @@ def run_suite(config=None, candidate_fn=None, workloads=None, candidate_prepare_
     entries = make_workloads(cfg) if workloads is None else workloads
     if cfg.warmup < 0 or cfg.iters < 1 or cfg.trials < 1 or cfg.correctness_runs < 1:
         raise ValueError("warmup must be nonnegative; repeat, trials and correctness runs positive")
-    # One GPU on Thor; nvidia-smi reports no memory use there, so "auto" cannot rank devices.
-    device = choose_device("cuda:0" if cfg.device == "auto" else cfg.device)
-    major, minor = torch.cuda.get_device_capability(device)
-    if (major, minor) != (11, 0):
-        raise RuntimeError(
-            f"this task targets Jetson Thor (compute capability 11.0), not {major}.{minor}"
-        )
-    weights, golden = baseline.load_model(device)
-    flush_src = torch.ones(common.FLUSH_BYTES // 4, dtype=torch.float32, device=device)
-    flush_dst = torch.empty((), dtype=torch.float32, device=device)
-
-    def flush():
-        torch.sum(flush_src, dim=0, out=flush_dst)
-
-    print(
-        f"OP: {TASK_NAME} ({len(entries)} frames, "
-        f"warmup/iters/trials {cfg.warmup}/{cfg.iters}/{cfg.trials})"
-    )
-    rows = []
+    # Locked from the first CUDA call: an unlocked model load overlapped others' timed runs.
     with common._gpu_lock():
+        # One GPU on Thor; nvidia-smi reports no memory use there, so "auto" cannot rank devices.
+        device = choose_device("cuda:0" if cfg.device == "auto" else cfg.device)
+        major, minor = torch.cuda.get_device_capability(device)
+        if (major, minor) != (11, 0):
+            raise RuntimeError(
+                f"this task targets Jetson Thor (compute capability 11.0), not {major}.{minor}"
+            )
+        weights, golden = baseline.load_model(device)
+        flush_src = torch.ones(common.FLUSH_BYTES // 4, dtype=torch.float32, device=device)
+        flush_dst = torch.empty((), dtype=torch.float32, device=device)
+
+        def flush():
+            torch.sum(flush_src, dim=0, out=flush_dst)
+
+        print(
+            f"OP: {TASK_NAME} ({len(entries)} frames, "
+            f"warmup/iters/trials {cfg.warmup}/{cfg.iters}/{cfg.trials})"
+        )
+        rows = []
         for entry in entries:
             k = FRAMES.index(int(entry["axes"]["frame"]))
             row = {"suite": entry["suite"], "id": entry["id"], "axes": entry["axes"]}
