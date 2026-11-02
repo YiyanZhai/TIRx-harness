@@ -11,8 +11,10 @@ controls, calibration runs and the 997-frame task gate stay there.
 
 ## 1. One-time setup
 
-Prerequisites: `uv`, Claude Code, and SSH access to the Thor (`yiyanz@catalyst-thor`, 192.168.10.117 on the lab
-LAN). Add the agent machine's public key to the Thor's `~/.ssh/authorized_keys`.
+Prerequisites: `uv`, Claude Code, Cargo with Rust 1.89 or later and a C linker (the local NumSim Synccheck and
+Racecheck build a Rust crate, see `docs/installation.md`; the M1 run's machine had Rust 1.79 and could not run
+them), and SSH access to the Thor (`yiyanz@catalyst-thor`, 192.168.10.117 on the lab LAN). Add the agent
+machine's public key to the Thor's `~/.ssh/authorized_keys`.
 
 ```bash
 git clone -b groot-ah-boundary-thor git@github.com:YiyanZhai/TIRx-harness.git
@@ -50,9 +52,11 @@ python evolution/remote/kcoral_remote.py groot/ah_boundary_thor baseline --remot
 
 Measured self-checks on the Thor: M1 0.999x, M2 0.996x, M3 0.990-0.993x, M4 1.019x.
 
-Run at most two tasks at a time. There is one Thor GPU: the server has one worker, and every suite takes the shared
-GPU timing lock, which other users of the Thor can hold for 20+ minutes. A request waits up to its 3600 s budget, then
-fails with a clear error.
+Run at most two tasks at a time. There is one Thor GPU and the server has one worker, which does not queue: a
+request that arrives while the worker is busy fails after 30 s with HTTP 503 (`no_worker`) and must be resubmitted
+once the running request finishes. A scoring request keeps the worker while it waits for the shared GPU timing lock,
+which other users of the Thor can hold for 20+ minutes, up to its 3600 s budget; during the M1 run single requests
+kept the worker for up to 34 minutes.
 
 ## 3. Launch the agent
 
@@ -142,10 +146,18 @@ M3's best chain is 2.2x and its floor 2.4x.
   4.8's `IKET_INJECTION_CONFIG` to the `SMODEL_INJECTION_CONFIG` that TVM 0.27 reads. Checked 2026-10-31 with an
   annotated TIRx-lite kernel through the remote path and with tirx-kernels' FA4 (tcgen05, TMA, 2336 ranges on 20
   SMs); clusters larger than 1 are untested.
+- M1's TensorRT time does not depend on a well-behaved partner. On boundary 0 it measured 130.0-130.2 us
+  against a TensorRT copy, a 6 us one-kernel graph, a 55 us sleep kernel and the M1 run's gated frontier
+  (45 us), after either arm, with the GPU and memory clocks at their maximum throughout (2026-10-31,
+  `kda/tirx/m1_coupling.py` in groot-perf-diagnosis). The M1 run's flag-in-data variant moved it to ~109 us in
+  two runs, for a reason not yet known. If a run's TensorRT medians leave about 126-135 us, the candidate is
+  changing the baseline: report it, and do not trust that score until the baseline is back in range.
 - ncu on the Thor must run with `--clock-control none`, and even then it flushes L2 and the clocks drop
   between replays, so kernel times read 2-5x their in-chain values. Use the benchmark's timings.
 - Compute Sanitizer, nsys, nvdisasm and cuobjdump (CUDA 13.1) are on the worker; reach the last three with
-  `kcoral_remote.py --cmd`.
+  `kcoral_remote.py --cmd`. Memcheck and synccheck finish M1's persistent kernel in about a minute. Racecheck
+  instruments every access of the spin loops and did not finish within an 1800 s request, holding the GPU the whole
+  time; skip it for spin-loop kernels and use the local NumSim Racecheck.
 
 ## 5. Results and rechecks
 
