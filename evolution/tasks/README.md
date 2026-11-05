@@ -455,9 +455,14 @@ whole action-head denoising loop of one frame on Jetson AGX Thor (sm_110a):
 4 steps of action encoder (fp16 MLP), DiT (32 NVFP4 W4A4 blocks on 41
 tokens) and action decoder (fp16 MLP) with the Euler update, from the
 initial noise to the final actions, as the GR00T runtime runs it after the
-backbone. The task requires one persistent kernel per call. The four rows
-are the loop of one real LIBERO frame from four initial noises (the frame's
-own draw and three seeded draws). The baseline is the three TensorRT engines
+backbone. The task requires one persistent kernel per call. The twelve rows
+are the loop of one real LIBERO frame: from four initial noises (the frame's
+own draw and three seeded draws) at the frame's 156 VL tokens, and under eight
+other instructions, with 140-172 VL tokens. The token count follows the
+instruction, and only one of LIBERO-10's ten tasks has 156, so the kernel must
+take it from the tensors' shapes. The runtime keeps one graph per count, so
+setup runs per count in one process, and the suite checks that the first
+count's launch still works after later setups. The baseline is the three TensorRT engines
 with the runtime's glue, 4 steps in one CUDA graph: 2116 kernels, 15.8-16.0
 ms per loop here. The DRAM floor is ~7.8 ms; the best per-op chain takes
 ~8.2 ms. A loop megakernel can start the next step's DiT weight stream while
@@ -467,7 +472,9 @@ The task reuses the M1 and M2 files (`action_{encoder,decoder}.engine`,
 `weights.safetensors`, `dit_nvfp4.engine`, `dit_weights.safetensors`) and
 adds `loop_golden.safetensors` and `loop_manifest.json`, built by
 `kda/tirx/m5_prepare.py` in groot-perf-diagnosis: the frame's inputs, the
-per-step constants, the four noises and frame 30's cross K/V for the probe.
+per-step constants, the four noises and frame 30's cross K/V for the probe;
+and `loop_lens.safetensors` and `loop_lens_manifest.json`, built by
+`kda/tirx/m5_lens.py`: the same for the eight other instructions.
 Its baseline and oracle import the boundary and DiT tasks'.
 
 The candidate writes two outputs: the final actions and every step's DiT

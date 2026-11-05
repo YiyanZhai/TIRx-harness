@@ -27,7 +27,8 @@ def test_task_plan_and_bundle():
         shape_mode=mode,
     )
     assert rows == bench.make_workloads(replace(bench.default_config(), **overrides))
-    assert [row["axes"]["noise"] for row in rows] == list(bench.ROWS) and candidate is None
+    assert [row["axes"]["row"] for row in rows] == list(bench.ROWS) and candidate is None
+    assert [row["axes"]["vl_tokens"] for row in rows] == [156] * 4 + [140, 145, 149, 150, 151, 152, 155, 172]
     sources = adapter.harness_sources(name)
     # The loop reuses both the boundary task's and the DiT task's baselines and oracles.
     for file in (
@@ -88,8 +89,27 @@ def test_probe_uses_another_scene():
         "cross_values": torch.zeros(16, 1, 32, 156, 48).half(),
     }
     before = {k: v.clone() for k, v in data.items()}
-    bench._perturb(data, golden, 0)
+    bench._perturb(data, golden, "noise0", 0)
     assert torch.equal(data["cross_keys"], golden["probe.cross_keys"])
     assert torch.equal(data["cross_values"], golden["probe.cross_values"])
     for name in ("initial_actions", "state_features"):
         assert not torch.equal(data[name], before[name])
+
+
+def test_len_rows_read_their_own_tensors():
+    gen = torch.Generator().manual_seed(2)
+    golden = {
+        "noise0": torch.randn(1, 40, 132, generator=gen).half(),
+        "cross_keys": torch.randn(16, 1, 32, 156, 48, generator=gen).half(),
+        "probe.cross_keys": torch.randn(16, 1, 32, 156, 48, generator=gen).half(),
+        "len145.initial_actions": torch.randn(1, 40, 132, generator=gen).half(),
+        "len145.cross_keys": torch.randn(16, 1, 32, 145, 48, generator=gen).half(),
+        "len145.probe.cross_keys": torch.randn(16, 1, 32, 145, 48, generator=gen).half(),
+    }
+    tensor = bench.baseline.row_tensor
+    assert tensor(golden, "noise0", "initial_actions") is golden["noise0"]
+    assert tensor(golden, "noise0", "probe.cross_keys") is golden["probe.cross_keys"]
+    assert tensor(golden, "len145", "initial_actions") is golden["len145.initial_actions"]
+    assert tensor(golden, "len145", "cross_keys").shape[3] == 145
+    assert tensor(golden, "len145", "probe.cross_keys").shape[3] == 145
+    assert bench.baseline.vl_tokens("noise2") == 156 and bench.baseline.vl_tokens("len172") == 172

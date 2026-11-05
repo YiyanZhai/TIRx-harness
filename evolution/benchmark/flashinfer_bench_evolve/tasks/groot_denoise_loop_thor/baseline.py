@@ -49,16 +49,30 @@ OUTPUTS = ("actions_out", "model_outputs")
 FRAME = ("cross_keys", "cross_values", "image_mask", "backbone_attention_mask")
 
 
+def vl_tokens(row):
+    """The row's VL token count (128 image tokens + the instruction's text tokens)."""
+
+    return int(row[3:]) if row.startswith("len") else 156
+
+
+def row_tensor(golden, row, name):
+    """One row's tensor: a len row's own `<row>.<name>`; otherwise the first rows' `<row>` or `<name>`."""
+
+    if f"{row}.{name}" in golden:
+        return golden[f"{row}.{name}"]
+    return golden[row] if name == "initial_actions" else golden[name]
+
+
 def model_dir() -> Path:
     """The provisioned model directory (no download source exists)."""
 
     root = Path(os.environ.get("HF_MODEL_PATH", "/raid/catalyst/models")).expanduser()
     path = root / SUBDIR
-    if not (path / "loop_manifest.json").is_file():
+    if not all((path / name).is_file() for name in ("loop_manifest.json", "loop_lens_manifest.json")):
         raise FileNotFoundError(
             f"{path} has no denoising-loop files; build them with groot-perf-diagnosis "
-            "kda/tirx/m1_prepare.py, m2_prepare.py and m5_prepare.py and point HF_MODEL_PATH at "
-            "the directory's parent"
+            "kda/tirx/m1_prepare.py, m2_prepare.py, m5_prepare.py and m5_lens.py and point "
+            "HF_MODEL_PATH at the directory's parent"
         )
     return path
 
@@ -74,8 +88,10 @@ def load_model(device):
         {k: v.to(device) for k, v in load_file(str(path / "dit_weights.safetensors")).items()}
     )
     golden = load_file(str(path / "loop_golden.safetensors"))
+    golden.update(load_file(str(path / "loop_lens.safetensors")))
     block_types = json.loads((path / "dit_manifest.json").read_text())["block_types"]
     rows = json.loads((path / "loop_manifest.json").read_text())["noise_rows"]
+    rows = [*rows, *json.loads((path / "loop_lens_manifest.json").read_text())["len_rows"]]
     return weights, golden, block_types, rows
 
 

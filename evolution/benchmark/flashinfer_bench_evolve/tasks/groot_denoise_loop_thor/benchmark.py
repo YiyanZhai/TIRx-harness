@@ -2,10 +2,14 @@
 """GR00T N1.7 action-head denoising loop on Jetson Thor, against the deployed TensorRT sequence.
 
 Each workload row is one frame's whole loop (4 steps of action encoder, DiT, action decoder and
-Euler update) on the backbone outputs of one real LIBERO frame, from a different initial noise:
-noise0 is the frame's own draw, noise1-3 are seeded draws. Timing, graph capture, the kernel-node
-count and the shared GPU lock reuse the action-head boundary task's validated helpers:
-alternating graph replays, each sample after a 128 MB L2-evicting read, memory clock warmed first.
+Euler update) on the backbone outputs of one real LIBERO frame. noise0-3 are the golden instruction
+(156 VL tokens) from four initial noises: noise0 is the frame's own draw, noise1-3 are seeded draws.
+len<L> are the same frame and noise0 under another instruction, so with L VL tokens: LIBERO-10's
+tasks have 145-156, and only one of the ten has 156. The deployed runtime keeps one action-head graph
+per token count, so setup runs once per count in one process, and a count set up earlier must keep
+working after later ones; the suite checks that. Timing, graph capture, the kernel-node count and the
+shared GPU lock reuse the action-head boundary task's validated helpers: alternating graph replays,
+each sample after a 128 MB L2-evicting read, memory clock warmed first.
 
 The gate checks both outputs against the oracle: the final actions, and every step's DiT output
 (model_outputs). NVFP4 activation quantization in the DiT flips borderline roundings, so correct
@@ -18,6 +22,7 @@ input-dependence check, and the probe swaps in another scene's K/V.
 from __future__ import annotations
 
 import statistics
+import time
 
 import torch
 
@@ -39,7 +44,11 @@ HARNESS_FILES = tuple(
     )
 )
 
-ROWS = ("noise0", "noise1", "noise2", "noise3")
+NOISE_ROWS = ("noise0", "noise1", "noise2", "noise3")
+LEN_ROWS = ("len140", "len145", "len149", "len150", "len151", "len152", "len155", "len172")
+ROWS = (*NOISE_ROWS, *LEN_ROWS)
+# A setup after the first row's may compile for its token count, but must not take this long.
+SETUP_MAX_S = 60.0
 # Relative L2 limits: about 1.4x the largest error of TensorRT and the independent implementation
 # over the four rows and the probe (calibrated with groot-perf-diagnosis kda/tirx/m5_calib.py).
 # They reach 0.0035 on the actions, 0.032, 0.039, 0.056, 0.070 on the four steps' DiT outputs, and
@@ -52,6 +61,10 @@ STEP_MAX_ABS = (1.0, 1.0, 1.0, 1.0)
 # The state reaches the actions only through attention (zeroing it moves them by 0.005), so its
 # use is checked on its own row of the DiT outputs: zeroed, that row is 0.09-0.13 off.
 ROW0_MAX_REL = (0.05, 0.05, 0.05, 0.05)
+# One step may exceed that up to ROW0_ONE_STEP_MAX_REL: on len150, TensorRT and the independent
+# implementation both reach 0.063-0.064 on step 2 and stay near 0.02 elsewhere. A state read once in
+# setup is over 0.05 on at least two steps on 11 of the 12 rows, zeroed state on all rows.
+ROW0_ONE_STEP_MAX_REL = 0.09
 # The probe adds noise to initial_actions (0.25 of their std) and state_features (2.0 of its std),
 # and swaps in another scene's cross K/V. Outputs computed before the change sit at 0.27 (actions);
 # ignoring the new noise 0.24 (actions), the new K/V 0.12-0.13 (actions) and 0.36-0.59 (steps),
@@ -68,7 +81,12 @@ def make_workloads(config=None):
         {
             "suite": "official",
             "id": row,
-            "axes": {"noise": row, "steps": baseline.STEPS, "tokens": 41},
+            "axes": {
+                "row": row,
+                "vl_tokens": baseline.vl_tokens(row),
+                "steps": baseline.STEPS,
+                "tokens": 41,
+            },
             "raw": {"uuid": row},
         }
         for row in ROWS
@@ -80,9 +98,8 @@ def make_data(weights, golden, row, device, block_types):
 
     data = dict(weights)
     data["block_types"] = list(block_types)
-    data["initial_actions"] = golden[row].to(device).clone()
-    for name in (*baseline.INPUTS[1:], *baseline.CONSTANTS):
-        data[name] = golden[name].to(device).clone()
+    for name in (*baseline.INPUTS, *baseline.CONSTANTS):
+        data[name] = baseline.row_tensor(golden, row, name).to(device).clone()
     data["actions_out"] = torch.empty_like(data["initial_actions"])
     data["model_outputs"] = torch.empty(
         baseline.STEPS, 1, 41, 1024, dtype=torch.float16, device=device
@@ -125,12 +142,18 @@ def _check(data, expected, label):
             f"(limit {ACTIONS_MAX_ABS})"
         )
     step_ratio = 0.0
+    row0 = [
+        _err(data["model_outputs"][k][:, :1], expected[1][k][:, :1])[0]
+        for k in range(baseline.STEPS)
+    ]
+    row0_over = sum(r0 > limit for r0, limit in zip(row0, ROW0_MAX_REL))
     for k in range(baseline.STEPS):
         out, ref = data["model_outputs"][k], expected[1][k]
         r, w = _err(out, ref)
-        r0, _ = _err(out[:, :1], ref[:, :1])
+        r0 = row0[k]
         step_ratio = max(step_ratio, r / STEP_MAX_REL[k])
-        if r > STEP_MAX_REL[k] or w > STEP_MAX_ABS[k] or r0 > ROW0_MAX_REL[k]:
+        row0_bad = r0 > ROW0_ONE_STEP_MAX_REL or (r0 > ROW0_MAX_REL[k] and row0_over > 1)
+        if r > STEP_MAX_REL[k] or w > STEP_MAX_ABS[k] or row0_bad:
             bad.append(
                 f"model_outputs[{k}] relative L2 {r:.4f} (limit {STEP_MAX_REL[k]}), max abs "
                 f"{w:.4f} (limit {STEP_MAX_ABS[k]}), state row {r0:.4f} (limit {ROW0_MAX_REL[k]})"
@@ -145,7 +168,7 @@ def _poison(data):
         data[name].fill_(float("nan"))
 
 
-def _perturb(data, golden, seed):
+def _perturb(data, golden, row, seed):
     """New noise and state values, and another scene's cross K/V (frame 30 of the episode)."""
 
     for i, (name, scale) in enumerate(PROBE_SCALE.items()):
@@ -154,13 +177,14 @@ def _perturb(data, golden, seed):
         noise = torch.randn(t.shape, generator=gen, device=t.device, dtype=torch.float32)
         t.copy_((t.float() + scale * t.float().std() * noise).to(t.dtype))
     for name in ("cross_keys", "cross_values"):
-        data[name].copy_(golden[f"probe.{name}"])
+        data[name].copy_(baseline.row_tensor(golden, row, f"probe.{name}"))
 
 
 def _run_row(
-    k, weights, golden, block_types, device, cfg, candidate_fn, candidate_prepare_fn, flush
+    k, weights, golden, block_types, device, cfg, candidate_fn, candidate_prepare_fn, flush, first
 ):
     row = ROWS[k]
+    tokens = baseline.vl_tokens(row)
     stream = torch.cuda.Stream(device)
     base_data = make_data(weights, golden, row, device, block_types)
     base = baseline.TrtLoop(base_data)
@@ -170,10 +194,23 @@ def _run_row(
     base_rel, base_abs, base_steps = _check(base_data, expected, "TensorRT baseline")
 
     data = make_data(weights, golden, row, device, block_types)
+    setup_s = 0.0
     if candidate_fn is None:  # self-check: the baseline in both arms
         candidate = baseline.TrtLoop(data)
     else:
-        launch = candidate_prepare_fn(data)
+        started = time.perf_counter()
+        try:
+            launch = candidate_prepare_fn(data)
+        except Exception as exc:
+            raise AssertionError(
+                f"setup failed at {tokens} VL tokens: {type(exc).__name__}: {exc}"
+            ) from exc
+        setup_s = time.perf_counter() - started
+        if first and setup_s > SETUP_MAX_S:
+            raise AssertionError(
+                f"setup at {tokens} VL tokens took {setup_s:.0f} s (limit {SETUP_MAX_S:.0f} s after "
+                "the first row's)"
+            )
 
         def candidate():
             return candidate_fn(launch)
@@ -201,7 +238,7 @@ def _run_row(
     checks = cfg.correctness_runs
 
     if cfg.check_input_dependence:
-        _perturb(data, golden, 5000 + k)
+        _perturb(data, golden, row, 5000 + k)
         perturbed = baseline.reference(data, block_types)
         _poison(data)
         common._call(candidate, stream)
@@ -223,6 +260,20 @@ def _run_row(
             "guard probe: embodiment guard (NaN actions for a foreign embodiment_id) not honored"
         )
     checks += 1
+
+    if first and first["tokens"] != tokens:  # the setup of the first count still works after this one
+        _poison(first["data"])
+        common._call(first["candidate"], first["stream"])
+        _check(
+            first["data"],
+            first["expected"],
+            f"the {first['tokens']}-token setup called again after the {tokens}-token one",
+        )
+        checks += 1
+    if not first:
+        first.update(
+            tokens=tokens, data=data, expected=expected, candidate=candidate, stream=stream
+        )
 
     graphs = {}  # destroyed before the engines and modules whose kernels they captured
     try:
@@ -260,6 +311,10 @@ def _run_row(
         baseline_ms=baseline_ms,
         kernel_ms=kernel_ms,
         speedup=baseline_ms / kernel_ms,
+        vl_tokens=tokens,
+        setup_s=setup_s,
+        baseline_mean_ms=statistics.mean(samples["baseline"]),
+        kernel_mean_ms=statistics.mean(samples["candidate"]),
         baseline_p95_ms=common._p95(samples["baseline"]),
         kernel_p95_ms=common._p95(samples["candidate"]),
         samples=len(samples["candidate"]),
@@ -280,12 +335,20 @@ def _print_aggregate(rows):
     total_baseline = sum(row["baseline_ms"] for row in rows)
     total_kernel = sum(row["kernel_ms"] for row in rows)
     print()
-    print("# Aggregate result (one frame, four initial noises)")
+    print("# Aggregate result (one frame: four initial noises, eight other instructions)")
     print(
         f"| candidate ({len(rows)}/{len(rows)} PASS) | {total_kernel * 1000:.1f}us | "
         f"TensorRT {total_baseline * 1000:.1f}us | {total_baseline / total_kernel:.3f}x |",
         flush=True,
     )
+    print("| VL tokens | candidate median / mean / p95 ms | TensorRT median ms | speedup | setup s |")
+    for row in rows:
+        print(
+            f"| {row['vl_tokens']} | {row['kernel_ms']:.3f} / {row['kernel_mean_ms']:.3f} / "
+            f"{row['kernel_p95_ms']:.3f} | {row['baseline_ms']:.3f} | {row['speedup']:.3f}x | "
+            f"{row['setup_s']:.1f} |",
+            flush=True,
+        )
 
 
 @torch.no_grad()
@@ -317,8 +380,9 @@ def run_suite(config=None, candidate_fn=None, workloads=None, candidate_prepare_
             f"warmup/iters/trials {cfg.warmup}/{cfg.iters}/{cfg.trials})"
         )
         results = []
+        first = {}  # the first row's setup, kept to check it after the setups of other token counts
         for entry in entries:
-            k = ROWS.index(entry["axes"]["noise"])
+            k = ROWS.index(entry["axes"]["row"])
             result = {"suite": entry["suite"], "id": entry["id"], "axes": entry["axes"]}
             try:
                 result.update(
@@ -332,6 +396,7 @@ def run_suite(config=None, candidate_fn=None, workloads=None, candidate_prepare_
                         candidate_fn,
                         candidate_prepare_fn,
                         flush,
+                        first,
                     )
                 )
             except AssertionError as exc:
@@ -348,9 +413,10 @@ def run_suite(config=None, candidate_fn=None, workloads=None, candidate_prepare_
             results.append(result)
             print(result, flush=True)
             torch.cuda.empty_cache()
+        first.clear()
     _print_aggregate(results)
     if all(r["passed"] for r in results):
-        summarize(results, "noise")
+        summarize(results, "row")
     return results
 
 

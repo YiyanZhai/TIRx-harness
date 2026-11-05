@@ -46,7 +46,7 @@ curl -fsS http://127.0.0.1:8901/health    # expect "target":{"arch":"sm_110a"}
 | 3 | `groot_vlsa_xkv_thor` (M4) | `groot/vlsa_xkv_thor` | 2.12-2.13 ms, 29 + 4 kernels | DRAM floor 1.45 ms; best chain ~1.73 ms |
 | 4 | `groot_llm_prefill_thor` (M3) | `groot/llm_prefill_thor` | 5.36-5.51 ms, 364 kernels | DRAM floor 2.24 ms; best chain 2.42 ms |
 | 5 | `groot_vit_thor` (M6) | `groot/vit_thor` | 4.35 ms, 255 kernels | DRAM floor 1.6 ms; best chain ~2.58 ms |
-| 6 | `groot_denoise_loop_thor` (M5) | `groot/denoise_loop_thor` | 15.8-16.0 ms per loop, 2116 kernels | DRAM floor ~7.8 ms; best chain ~8.2 ms |
+| 6 | `groot_denoise_loop_thor` (M5) | `groot/denoise_loop_thor` | 15.8-16.0 ms per loop, 2116 kernels | DRAM floor ~7.8 ms; best chain ~8.2 ms; M2 with the chain's glue 7.8-8.05 ms in the pipeline |
 
 ```bash
 uv run --package tirx-evolution evolve init --task groot_ah_boundary_thor --name m1-ah-boundary \
@@ -144,9 +144,9 @@ it.
 M5 (denoising loop):
 
 ```text
-/goal Read ../PROMPT.md and reach at least 1.9x aggregate speedup over the deployed TensorRT denoising loop (action
-encoder, DiT and action decoder engines, 4 steps) on the Jetson Thor (stretch: 2.0x) with ONE TIRx-lite persistent
-kernel per call that passes every correctness check on all four rows. Score only through
+/goal Read ../PROMPT.md and reach at least 2.0x aggregate speedup over the deployed TensorRT denoising loop (action
+encoder, DiT and action decoder engines, 4 steps) on the Jetson Thor (stretch: 2.04x, the DRAM floor) with ONE TIRx-lite
+persistent kernel per call that passes every correctness check on all twelve rows, including the token-count rows. Score only through
 evolution/remote/kcoral_remote.py --remote http://127.0.0.1:8901; never run the benchmark on the local GPU (sm_120).
 Send one scoring request at a time and do not retry while one is queued: the
 Thor GPU is shared and requests can wait for its timing lock. Never change clocks or power: pass
@@ -160,8 +160,8 @@ chain is 1.95x (the 82-373 us per step publish cost once quoted here came from a
 whole ring in flight; it was withdrawn, and the evolved M2 beats our production chain by ~3-5 % per step); M4's
 DRAM floor caps it at 1.46x;
 M3's best chain is 2.2x and its floor 2.4x; M6's best chain is 1.69x (more than half of each block is per-kernel
-latency a megakernel can remove) and its DRAM floor 2.7x; M5's best chain is 1.94x and its floor ~2.04x (the gain is
-overlapping the next step's DiT weight stream with the boundary and the ~23 us per-step head and tail).
+latency a megakernel can remove) and its DRAM floor 2.7x; M5's best chain is 1.94x, the evolved M2 with the chain's glue about 2.0x in the pipeline, and its floor ~2.04x (the gain
+is overlapping the next step's DiT weight stream with the boundary and the ~23 us per-step head and tail).
 
 ## 4. What the worker provides
 

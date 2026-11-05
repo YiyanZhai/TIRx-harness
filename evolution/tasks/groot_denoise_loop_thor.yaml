@@ -38,7 +38,7 @@ spec: |
       n = LN(h, eps=1e-5) * (1 + scale) + shift
       q = Lin(blocks.i.attn1.to_q, n)
       cross: a = MHA(q, cross_keys[i // 2, 0], cross_values[i // 2, 0], mask)
-             [32 heads, 156 keys, 48]; mask = ~image_mask & backbone_attention_mask
+             [32 heads, L keys, 48]; mask = ~image_mask & backbone_attention_mask
              (text) if i % 4 == 0, else image_mask & backbone_attention_mask
       self:  a = MHA(q, Lin(blocks.i.attn1.to_k, n), Lin(blocks.i.attn1.to_v, n)),
              unmasked over the 41 tokens
@@ -58,17 +58,25 @@ spec: |
   g in fp16. Other rounding, reassociation and algebraic folding are allowed
   within the gate.
 
-  Workloads: noise0..noise3, the loop of one real LIBERO frame (its state
-  features, cross K/V and masks) from four initial noises: noise0 is the
-  frame's own draw, noise1-3 are seeded draws. The model files live on the
+  Workloads: twelve rows, the loop of one real LIBERO frame (its state
+  features, cross K/V and masks). noise0..noise3 are the frame's own
+  instruction, with L = 156 vision-language (VL) tokens, from four initial
+  noises: noise0 is the frame's own draw, noise1-3 are seeded draws. len140,
+  len145, len149, len150, len151, len152, len155 and len172 are the same frame
+  and noise0 under another instruction, with that many VL tokens. L is 128
+  image tokens plus the instruction's text tokens, so it follows the
+  instruction: LIBERO-10's ten tasks have 145, 149 (four tasks), 150, 151, 152,
+  155 and 156, and only one of them has 156. 140 and 172 are a shorter and a
+  longer instruction. Handle any L from 136 to 176. The model files live on the
   GPU worker under $HF_MODEL_PATH/groot-n17-libero-c235 (the M1 and M2 files
-  plus loop_golden.safetensors and loop_manifest.json).
+  plus loop_golden.safetensors, loop_manifest.json, loop_lens.safetensors and
+  loop_lens_manifest.json).
 
   Version contract: solution.py exports setup(data) -> a callable with no
   arguments. data holds CUDA tensors:
   - inputs initial_actions [1, 40, 132], state_features [1, 1, 1536],
-    cross_keys and cross_values [16, 1, 32, 156, 48] (fp16), image_mask and
-    backbone_attention_mask [1, 156] (bool) and embodiment_id [1] (int64):
+    cross_keys and cross_values [16, 1, 32, L, 48] (fp16), image_mask and
+    backbone_attention_mask [1, L] (bool) and embodiment_id [1] (int64):
     new values on every call in deployment; read them on every call;
   - constants of the deployed model: timestep_embeddings [4, 1, 40, 1536],
     adaln_modulations [4, 32, 1, 3072], output_modulations [4, 1, 3072] and
@@ -88,6 +96,19 @@ spec: |
   torch.cuda.current_stream(), without host synchronization, allocation, or
   other streams: the harness captures it in a CUDA graph and counts the
   graph's kernel nodes.
+
+  L comes from the tensors' shapes in setup. The tensors hold exactly L keys,
+  so reading past L is out of bounds. The deployed runtime keeps one
+  action-head CUDA graph per token count, captured before serving: setup runs
+  once per L in one process (this suite's rows share one process and one
+  weights dict), and the graphs of different L replay one at a time on one
+  stream. So a launch must keep working after later setups: the suite calls
+  the first row's launch again after each row with another L, and gates it.
+  Setups may share packed weights and compiled code, and a setup after the
+  first row's must finish within 60 s. Compiling per L, one compile that takes
+  L at run time, and a fixed internal layout that masks the keys beyond L are
+  all allowed; padded keys that are not masked dilute the attention and fail
+  the gate.
 
   Author every production kernel in TIRx-lite (import
   tirx_kernels.tirx_lite as txl; every launched kernel comes from
@@ -111,10 +132,11 @@ spec: |
     0.0035; the mildest defects 0.021);
   - model_outputs[s]: relative L2 at most 0.046, 0.055, 0.079, 0.098 for
     s = 0..3;
-  - row 0 of model_outputs[s] (the state token): relative L2 at most 0.05.
-    The state reaches the actions only through attention (zeroing it moves
-    them by 0.005), so this row checks that the state is read; zeroed, it is
-    0.09-0.13 off.
+  - row 0 of model_outputs[s] (the state token): relative L2 at most 0.05 on
+    all steps but one, and at most 0.09 on that one (correct implementations
+    reach 0.064 on one step of len150). The state reaches the actions only
+    through attention (zeroing it moves them by 0.005), so this row checks
+    that the state is read; zeroed, it is 0.07-0.15 off.
   Max abs errors are heavy-tailed, so their limits are flat (0.5 on the
   actions, 1.0 per step) and only catch garbage elements. The gate runs repeated calls with poisoned outputs, a call after an
   in-place change of the inputs (noise added to initial_actions and
@@ -122,15 +144,24 @@ spec: |
   which moves the actions by 0.13), the embodiment guard (NaN actions for a
   foreign embodiment_id), and a check of the outputs left by timing. Errors
   below the NVFP4 floor (a missing bias in one DiT block) are not detectable
-  here; before deployment a candidate must also pass the pipeline's
+  here, and neither is a mask wrong by one key (actions 0.004, steps at 0.83-0.93
+  of their limits); before deployment a candidate must also pass the pipeline's
   997-frame task gate.
 
   Timing and score: the baseline and candidate graphs are replayed
   alternately, every sample after a 128 MB read. The memory clock is warmed
   to its maximum first. Each row's time is the median of 3 trials x 40
   samples, and the suite holds the machine's shared GPU timing lock. Score =
-  sum of the four TensorRT medians / sum of the four candidate medians.
+  sum of the twelve TensorRT medians / sum of the twelve candidate medians. The
+  suite also reports each row's mean and p95.
   Reference points, not the score:
+  - The loop to beat for use in the pipeline is not TensorRT's. The evolved DiT
+    step megakernel with the chain's encoder / decoder takes 7.8-8.05 ms per
+    loop in the pipeline at 156 tokens (4 DiT steps 7.63-7.91 ms mean, 3
+    boundaries 0.14 ms, first encoder and last decoder 0.05 ms; nsys,
+    2026-11-05): about 2.0x this suite's TensorRT. It is timed there only at 156
+    tokens, and this suite's flush before every sample is colder than the
+    pipeline, where K/V were just written and steps run back to back.
   - TensorRT takes 15.8-16.0 ms per loop here (4 DiT steps of 3.81-3.90 ms
     plus the encoder / decoder engines and glue). In baseline
     self-checks (TensorRT in both arms) per-row ratios ranged 0.989-1.009
@@ -164,6 +195,14 @@ spec: |
     have weight streams in flight.
   - At 192 KB of shared memory one 8-CTA cluster fits (or four 4-CTA
     clusters).
+  - Under GPU load the DVFS polling kworker (devfreq_wq) runs about 25 % of the
+    time, in bursts (two of ~2.5 ms every ~20 ms), and GPU DRAM bandwidth falls
+    from ~256 to 150-230 GB/s in them. It cannot be turned off here. Its cost
+    depends on the design: in calls where the kworker ran for at least 30 % of
+    a DiT step, the evolved DiT step megakernel, whose stream runs at the DRAM
+    floor, was ~130 us slower than in calls without it, and the per-op chain
+    ~28 us. A ~8 ms loop usually overlaps a burst, so the loop's median includes
+    this cost; a design with no slack pays the most.
 
   First run the baseline self-check on Thor, then establish a correct
   candidate and save its per-row timings. Remeasure promising candidates to
