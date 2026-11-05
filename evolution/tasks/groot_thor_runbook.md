@@ -156,7 +156,9 @@ it.
 ```
 
 Why these targets: M1's TensorRT is latency-bound small GEMMs (2x = ~65 us, near the best per-op chain); M2's best
-chain is 1.95x and a megakernel pays 82-373 us per step in cross-CTA publishes; M4's DRAM floor caps it at 1.46x;
+chain is 1.95x (the 82-373 us per step publish cost once quoted here came from a composite whose loader kept the
+whole ring in flight; it was withdrawn, and the evolved M2 beats our production chain by ~3-5 % per step); M4's
+DRAM floor caps it at 1.46x;
 M3's best chain is 2.2x and its floor 2.4x; M6's best chain is 1.69x (more than half of each block is per-kernel
 latency a megakernel can remove) and its DRAM floor 2.7x; M5's best chain is 1.94x and its floor ~2.04x (the gain is
 overlapping the next step's DiT weight stream with the boundary and the ~23 us per-step head and tail).
