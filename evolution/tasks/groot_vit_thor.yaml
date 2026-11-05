@@ -1,0 +1,149 @@
+name: groot_vit_thor
+# GR00T N1.7 backbone ViT (24 FP8 blocks on 512 patches, deepstack and final mergers) of one frame on Jetson Thor, as one persistent kernel.
+workload_dir: candidates/groot/vit_thor
+kernel_authoring: TIRx-lite
+sota_baseline:
+  name: tensorrt_10_16_deployed_engine
+bench_timeout_s: 3600
+banned_paths: []
+spec: |
+  Implement the GR00T N1.7 backbone ViT (the Qwen3-VL vision tower, batch 1,
+  the 512 patches of one frame's two 256-patch images) on NVIDIA Jetson AGX
+  Thor (compute capability 11.0, CUDA target sm_110a) as ONE persistent
+  kernel launch (a megakernel), and beat the deployed TensorRT 10.16 engine
+  measured on the same Thor in the same run (about 255 kernels per call: FP8
+  GEMMs, quantize, LayerNorm, rope, attention and elementwise kernels).
+  Verify the device before compiling or scoring; stop and report unless its
+  compute capability is (11, 0).
+
+  Computation. Hidden 1024, 16 heads of 64, FFN 4096, 512 patch rows
+  (rows 0-255 are image 0, rows 256-511 image 1).
+    h = fp16(pixel_values [512, 1536] @ patch_embed.w^T + patch_embed.b) + pos_embed
+    for block i in 0..23 (p = blocks.i):
+      qkv = Lin8(p.qkv, LN(h, p.norm1)) [512, 3072] = q | k | v, each [512, 16, 64]
+      q = Rope(q), k = Rope(k) (per head; Rope(y) = y cos + cat(-y[32:], y[:32]) sin
+          with cos = rope.cos[row], sin = rope.sin[row], fp32 tables [512, 64])
+      a = attention within each image (rows 0-255 attend to rows 0-255, rows
+          256-511 to rows 256-511): s = fp16(q k^T) * fp16(attn_scale),
+          softmax in fp32, probabilities stored in fp16; a [512, 1024]
+      h = h + Lin8(p.proj, a)
+      h = h + Lin8(p.fc2, GeluTanh(Lin8(p.fc1, LN(h, p.norm2))))
+      after blocks 5, 11, 17 (j = 0, 1, 2):
+        deepstack_features[j] = Merge(LN(h viewed as [128, 4096], deepstack.j.norm), deepstack.j)
+    image_embeds = Merge(LN(h, merger.norm) viewed as [128, 4096], merger)
+  Merge(x, m) = Lin8(m.fc2, GeluErf(Lin8(m.fc1, x))) [128, 2048]: row r of
+  the [128, 4096] view joins patch rows 4r..4r+3 (a 2x2 patch group). The
+  deepstack mergers normalize over 4096 after the join, the final merger
+  over 1024 before it. LN(y, n) is LayerNorm with weight n.w, bias n.b and
+  eps 1e-6, fp32 statistics, fp16 output. Lin8(p, y) is an FP8 linear with
+  bias: q = e4m3(clamp(y / p.sx, -448, 448)), out = sum_k (q p.sxd)(w p.sw)
+  + p.b, with p.w the e4m3 weight [N, K] as raw bytes, p.sw, p.sx, p.sxd
+  0-dim fp32 tensors and p.b fp16 [N]; the graph quantizes with the fp32
+  scale sx and dequantizes with its fp16 rounding sxd (they differ by up to
+  4e-4). GeluTanh(u) = 0.5 u (1 + tanh(0.79788 (u + 0.044715 u^3))) and
+  GeluErf(u) = 0.5 u (1 + erf(u / 1.41421)), every step stored in fp16 in the
+  exported graph. The exported graph accumulates in fp32 and stores h, every
+  LayerNorm and linear output, q and k after rope, a and both GELU outputs
+  in fp16. Other rounding and accumulation orders are allowed within the
+  gate.
+
+  Workloads: frame0, frame1, frame30 and frame31, four real frames of one
+  LIBERO episode. The model files live on the GPU worker under
+  $HF_MODEL_PATH/groot-n17-libero-c235 (vit_* files).
+
+  Version contract: solution.py exports setup(data) -> a callable with no
+  arguments. data holds CUDA tensors:
+  - the input pixel_values [512, 1536] fp16 (new values on every call in
+    deployment; read it on every call);
+  - the weights patch_embed.{w [1024, 1536], b} and pos_embed [512, 1024]
+    (fp16), rope.{cos, sin} [512, 64] (fp32), attn_scale (0-dim fp32),
+    blocks.<i>.{norm1, norm2}.{w, b} (fp16 [1024]),
+    blocks.<i>.{qkv, proj, fc1, fc2}.{w, sw, sx, sxd, b},
+    deepstack.<j>.norm.{w, b} (fp16 [4096]), deepstack.<j>.{fc1, fc2}.{...},
+    merger.norm.{w, b} (fp16 [1024]) and merger.{fc1, fc2}.{...};
+  - the preallocated outputs image_embeds [128, 2048] and
+    deepstack_features [3, 128, 2048] (fp16).
+  setup may compile, allocate scratch, repack weights (for example into
+  tile-contiguous layouts) and precompute from weights; the rope tables,
+  the position embedding and the patch layout are constants of the
+  deployed engine. Every call must overwrite both outputs and must not
+  modify inputs or weights. One call must launch exactly one kernel on
+  torch.cuda.current_stream(), without host synchronization, allocation, or
+  other streams: the harness captures it in a CUDA graph and counts the
+  graph's kernel nodes.
+
+  Author every production kernel in TIRx-lite (import
+  tirx_kernels.tirx_lite as txl; every launched kernel comes from
+  @txl.kernel), compiled for sm_110a through the TIRx pipeline. The worker
+  exports TIRX_PREPARE_CUDA_ARCH=sm_110a, which retargets kernels traced
+  with tirx-kernels' B200 default (arch="sm_100a"); compiled for sm_100a,
+  tcgen05 kernels fail to load on Thor. Do not call TensorRT, cuBLAS,
+  PyTorch tensor operators, Triton, CUTLASS/CuTe DSL, raw CUDA, or existing
+  solution kernels for production computation. Do not change the benchmark,
+  oracle, workloads, model files, or server environment to make a candidate
+  pass.
+
+  Correctness: the oracle is an independent PyTorch emulation of the
+  exported graph (fp32, TF32 off, the graph's FP8 rule). The ViT is chaotic:
+  FP8 activation quantization flips borderline roundings and 24 blocks
+  amplify the flips, so TensorRT and an independent CUDA implementation sit
+  0.14-0.24 (image_embeds), 0.033-0.038 (deepstack 0) and 0.09-0.135
+  (deepstack 1, 2) from the oracle in relative L2. Both outputs must be
+  finite, with a relative L2 error of at most 0.34 for image_embeds and
+  0.055, 0.19, 0.185 for deepstack levels 0, 1, 2 on every frame (1.4x the
+  largest legitimate error). The gate runs repeated calls with poisoned
+  outputs, a call after an in-place change of pixel_values (Gaussian noise
+  of 0.25 of their std; an output computed before the change sits at
+  0.43-0.56 / 0.22-0.31 / 0.37-0.50 / 0.38-0.49), and a check of the outputs
+  left by timing. Errors at or below the floor are not detectable here:
+  unquantized activations (W8A16) and erf GELU in the blocks land below it.
+  Before deployment a candidate must also pass the pipeline's 997-frame
+  task gate.
+
+  Timing and score: the baseline and candidate graphs are replayed
+  alternately, every sample after a 128 MB read. The memory clock is warmed
+  to its maximum first. Each frame's time is the median of 3 trials x 60
+  samples, and the suite holds the machine's shared GPU timing lock.
+  Score = sum of the four TensorRT medians / sum of the four candidate
+  medians. Reference points, not the score:
+  - TensorRT takes 4.35 ms per call here (255 kernels in one CUDA graph).
+    In two baseline self-checks (TensorRT in both arms) per-frame ratios
+    ranged 0.996-1.008 and the aggregate 1.002-1.004.
+  - Floors: DRAM 1.6 ms (406 MB of FP8 weights at 255 GB/s: 12.6 MB per
+    block, 25 MB per merger); L2 -> SM operand bandwidth 1.34 ms; MMA
+    0.65 ms (FP8, 512 TFLOPS).
+  - The best per-op chain takes ~2.58 ms: CUTLASS 2-SM FP8 GEMMs (256 x 256
+    pair tiles, 4x1 clusters with the token tile multicast), Gluon attention
+    and LayerNorm kernels chained by PDL, plus a decoupled TMA engine that
+    stages weights into L2. Per block ~84 us against 47 us of DRAM and 25 us
+    of MMA: 4 GEMMs ~55 us (MMA at the 20-SM peak 25 us, ~4 us fixed cost
+    per launch for the release wait, pipeline fill and last-tile epilogue,
+    4 idle SMs 6 us, tile bubbles 3 us), attention ~14 us, two LayerNorms
+    9 us and rope 5.5 us, mostly launch latency. The four mergers take
+    ~123 us each against 94 us of DRAM. More than half of each block is
+    per-kernel latency on a chain of 8 dependent kernels.
+
+  Thor:
+  - 20 SMs, 228 KB shared memory per SM, 32 MB L2, ~255 GB/s achievable TMA
+    read bandwidth, ~1.35-1.6 TB/s chip-wide L2 -> SM bandwidth.
+  - A block's 12.6 MB of weights fits in L2, so the block GEMMs are bound
+    by L2 -> SM bandwidth, not DRAM. Without multicast the k-step slows
+    once the chip's unique L2 reads reach ~1.45-1.6 TB/s: 1-SM 128 x 256
+    tiles keep 100 / 89 / 66 / 49 % of the MMA rate at 8 / 12 / 16 / 20 SMs.
+    With 4x1 clusters multicasting the token tile, 16 SMs run at the MMA
+    peak (Thor fits 4 clusters of 4, or 1 cluster of 8).
+  - A valid cross-CTA release compiles to MEMBAR.ALL.GPU and waits for the
+    SM's in-flight memory operations: 0.4-1.7 us with only L2 hits in
+    flight, 5-11 us with DRAM loads in flight. CTAs that publish results
+    should not have weight streams from DRAM in flight.
+  - Releases inside a cluster (mbarrier arrives, st.async to a peer's
+    shared memory) avoid the global fence, but DSMEM traffic reaches only
+    ~22 GB/s per SM.
+  - L2 prefetch instructions beyond about 1 MB per burst are dropped; stage
+    weights with real (TMA) loads. Load weights already consumed with
+    evict_first so they do not displace the next block's.
+
+  First run the baseline self-check on Thor, then establish a correct
+  candidate and save its per-frame timings. Remeasure promising candidates
+  to tell repeatable gains from noise. Do not change power or clocks during
+  the run.

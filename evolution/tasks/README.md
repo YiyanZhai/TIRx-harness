@@ -407,3 +407,91 @@ scale reaches 0.59), so its limit is a flat 1.0. Controls
 ```bash
 python evolution/remote/kcoral_remote.py groot/vlsa_xkv_thor baseline --remote http://127.0.0.1:8901
 ```
+
+## GR00T N1.7 ViT on Jetson Thor
+
+`groot_vit_thor` (workload `groot/vit_thor`) scores the GR00T N1.7 backbone
+ViT (the Qwen3-VL vision tower) on Jetson AGX Thor (sm_110a): the patch
+embedding, 24 FP8 pre-LayerNorm blocks on the 512 patches of two 256-patch
+images (16 heads x 64, 2D rope, attention within each image, GELU-tanh FFN
+4096), three deepstack mergers after blocks 5 / 11 / 17 and the final merger.
+The task requires one persistent kernel per call. The four rows are four real
+frames of one LIBERO episode. TensorRT runs 255 kernels and takes 4.35 ms per
+call here. The DRAM floor is 1.6 ms (406 MB of FP8 weights at 255 GB/s); the
+best per-op chain takes ~2.58 ms, and more than half of each of its blocks is
+per-kernel latency.
+
+The model files (`vit_fp8.engine`, `vit_weights.safetensors`,
+`vit_golden.safetensors`, `vit_manifest.json`) are built by
+`kda/tirx/m6_prepare.py` in groot-perf-diagnosis. The live engine reproduces
+the dumped pipeline calls bit for bit.
+
+The ViT is chaotic: FP8 activation quantization flips are amplified over 24
+blocks, so TensorRT and an independent CUDA implementation sit 0.14-0.24
+(image_embeds), 0.033-0.038 (deepstack 0) and 0.09-0.135 (deepstack 1, 2)
+from the oracle in relative L2. Every frame allows 1.4x the largest of
+those per output: 0.34, 0.055, 0.19, 0.185. A probe adds noise to
+pixel_values in place and reuses the limits. Controls
+(`kda/tirx/m6_controls/`):
+
+| control | relative L2 vs the oracle (image_embeds / deepstack 0) | verdict |
+| --- | --- | --- |
+| TensorRT (baseline) | 0.148-0.173 / 0.035-0.037 | PASS |
+| block 23 skipped | 2.65-2.80 / 0 | FAIL |
+| one attention over both images | 0.70-0.72 / 0.23-0.25 | FAIL |
+| deepstack mergers after blocks 6 / 12 / 18 | 0 / 1.02-1.05 | FAIL |
+| outputs cached in setup | 0.43-0.53 / 0.22-0.26 after the input change | FAIL |
+| activations not quantized (W8A16) | below the floor | passes, then the one-kernel check |
+| correct PyTorch implementation | passes, then 2742 kernels | FAIL (one-kernel check) |
+
+```bash
+python evolution/remote/kcoral_remote.py groot/vit_thor baseline --remote http://127.0.0.1:8901
+```
+
+## GR00T N1.7 denoising loop on Jetson Thor
+
+`groot_denoise_loop_thor` (workload `groot/denoise_loop_thor`) scores the
+whole action-head denoising loop of one frame on Jetson AGX Thor (sm_110a):
+4 steps of action encoder (fp16 MLP), DiT (32 NVFP4 W4A4 blocks on 41
+tokens) and action decoder (fp16 MLP) with the Euler update, from the
+initial noise to the final actions, as the GR00T runtime runs it after the
+backbone. The task requires one persistent kernel per call. The four rows
+are the loop of one real LIBERO frame from four initial noises (the frame's
+own draw and three seeded draws). The baseline is the three TensorRT engines
+with the runtime's glue, 4 steps in one CUDA graph: 2116 kernels, 15.8-16.0
+ms per loop here. The DRAM floor is ~7.8 ms; the best per-op chain takes
+~8.2 ms. A loop megakernel can start the next step's DiT weight stream while
+the boundary is still computing, and drop each step's ~23 us head and tail.
+
+The task reuses the M1 and M2 files (`action_{encoder,decoder}.engine`,
+`weights.safetensors`, `dit_nvfp4.engine`, `dit_weights.safetensors`) and
+adds `loop_golden.safetensors` and `loop_manifest.json`, built by
+`kda/tirx/m5_prepare.py` in groot-perf-diagnosis: the frame's inputs, the
+per-step constants, the four noises and frame 30's cross K/V for the probe.
+Its baseline and oracle import the boundary and DiT tasks'.
+
+The candidate writes two outputs: the final actions and every step's DiT
+output (`model_outputs`). The final actions are not chaotic (TensorRT and an
+independent implementation sit 0.0028-0.0035 from the oracle), but they
+barely depend on the state token (zeroing it moves them by 0.005) or on
+small changes of the frame's K/V. The DiT outputs are therefore checked per
+step (relative L2 0.046 / 0.055 / 0.079 / 0.098), and the state token's row
+of each on its own (0.05). Max abs errors are heavy-tailed, so their limits
+are flat (0.5 on the actions, 1.0 per step). The probe adds noise to the
+initial actions and the state and swaps in another scene's cross K/V (frame
+30, which moves the actions by 0.13). Controls (`kda/tirx/m5_controls/`):
+
+| control | first failing check | verdict |
+| --- | --- | --- |
+| TensorRT (baseline) | actions 0.0028-0.0031, steps at 0.65-0.69 of their limits | PASS |
+| timestep embeddings in reverse order | actions 0.029-0.032, step 0 0.48-0.51 | FAIL |
+| DiT block 31 skipped | actions 0.021-0.023, steps 0.11 | FAIL |
+| state features zeroed | state rows 0.09-0.11 | FAIL |
+| cross K/V read once in setup | the probe (actions 0.12-0.13) | FAIL |
+| state features read once in setup | the probe (state rows 0.06-0.09) | FAIL |
+| outputs cached in setup | the probe | FAIL |
+| the oracle itself, eagerly | passes, then graph capture fails | FAIL (one-kernel check) |
+
+```bash
+python evolution/remote/kcoral_remote.py groot/denoise_loop_thor baseline --remote http://127.0.0.1:8901
+```

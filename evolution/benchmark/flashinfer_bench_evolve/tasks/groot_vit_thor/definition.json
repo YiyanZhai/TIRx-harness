@@ -1,0 +1,38 @@
+{
+  "name": "groot_vit_thor",
+  "description": "GR00T N1.7 backbone ViT on Jetson Thor: patch embedding, 24 FP8 pre-LN blocks (16 heads x 64, 2D rope, attention within each of two 256-patch images, GELU-tanh FFN 4096), deepstack mergers after blocks 5/11/17 and the final merger, on the 512 patches of one frame, against the deployed TensorRT 10.16 engine.",
+  "op_type": "vision_transformer",
+  "tags": [
+    "dtype:fp8",
+    "dtype:fp16",
+    "status:real",
+    "device:jetson_thor_sm110",
+    "baseline:tensorrt"
+  ],
+  "axes": {
+    "frame": {"type": "const", "values": [0, 1, 30, 31]},
+    "patches": {"type": "const", "value": 512},
+    "blocks": {"type": "const", "value": 24}
+  },
+  "inputs": {
+    "pixel_values": {"shape": [512, 1536], "dtype": "float16"},
+    "patch_embed.w": {"shape": [1024, 1536], "dtype": "float16"},
+    "patch_embed.b": {"shape": [1024], "dtype": "float16"},
+    "pos_embed": {"shape": [512, 1024], "dtype": "float16"},
+    "rope.cos": {"shape": [512, 64], "dtype": "float32"},
+    "rope.sin": {"shape": [512, 64], "dtype": "float32"},
+    "attn_scale": {"shape": [], "dtype": "float32"},
+    "<prefix>.<norm>.w": {"shape": ["1024 or 4096"], "dtype": "float16"},
+    "<prefix>.<norm>.b": {"shape": ["1024 or 4096"], "dtype": "float16"},
+    "<prefix>.<fp8 linear>.w": {"shape": ["N", "K"], "dtype": "uint8 (e4m3 bytes)"},
+    "<prefix>.<fp8 linear>.sw": {"shape": [], "dtype": "float32"},
+    "<prefix>.<fp8 linear>.sx": {"shape": [], "dtype": "float32"},
+    "<prefix>.<fp8 linear>.sxd": {"shape": [], "dtype": "float32"},
+    "<prefix>.<fp8 linear>.b": {"shape": ["N"], "dtype": "float16"}
+  },
+  "outputs": {
+    "image_embeds": {"shape": [128, 2048], "dtype": "float16"},
+    "deepstack_features": {"shape": [3, 128, 2048], "dtype": "float16"}
+  },
+  "reference": "from flashinfer_bench_evolve.tasks.groot_vit_thor.baseline import reference as run\n"
+}

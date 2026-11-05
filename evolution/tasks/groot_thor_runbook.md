@@ -45,6 +45,8 @@ curl -fsS http://127.0.0.1:8901/health    # expect "target":{"arch":"sm_110a"}
 | 2 | `groot_dit_step_thor` (M2) | `groot/dit_step_thor` | 3.86-3.89 ms per step, 516 kernels | best per-op chain ~1.99 ms |
 | 3 | `groot_vlsa_xkv_thor` (M4) | `groot/vlsa_xkv_thor` | 2.12-2.13 ms, 29 + 4 kernels | DRAM floor 1.45 ms; best chain ~1.73 ms |
 | 4 | `groot_llm_prefill_thor` (M3) | `groot/llm_prefill_thor` | 5.36-5.51 ms, 364 kernels | DRAM floor 2.24 ms; best chain 2.42 ms |
+| 5 | `groot_vit_thor` (M6) | `groot/vit_thor` | 4.35 ms, 255 kernels | DRAM floor 1.6 ms; best chain ~2.58 ms |
+| 6 | `groot_denoise_loop_thor` (M5) | `groot/denoise_loop_thor` | 15.8-16.0 ms per loop, 2116 kernels | DRAM floor ~7.8 ms; best chain ~8.2 ms |
 
 ```bash
 uv run --package tirx-evolution evolve init --task groot_ah_boundary_thor --name m1-ah-boundary \
@@ -58,7 +60,7 @@ worktree; TensorRT runs in both arms, so the aggregate should be 0.98-1.02x:
 python evolution/remote/kcoral_remote.py groot/ah_boundary_thor baseline --remote http://127.0.0.1:8901
 ```
 
-Measured self-checks on the Thor: M1 0.999x, M2 0.996x, M3 0.990-0.993x, M4 1.019x.
+Measured self-checks on the Thor: M1 0.999x, M2 0.996x, M3 0.990-0.993x, M4 1.019x, M6 1.002-1.004x, M5 0.999-1.004x.
 
 Run at most two tasks at a time. There is one Thor GPU and the server has one worker, which does not queue: a
 request that arrives while the worker is busy fails after 30 s with HTTP 503 (`no_worker`) and must be resubmitted
@@ -126,9 +128,38 @@ self-check, then get a correct one-kernel candidate before optimizing. Remeasure
 it.
 ```
 
+M6 (ViT):
+
+```text
+/goal Read ../PROMPT.md and reach at least 1.8x aggregate speedup over the deployed TensorRT ViT engine on the Jetson
+Thor (stretch: 2.2x) with ONE TIRx-lite persistent kernel per call that passes every correctness check on all four
+frames. Score only through evolution/remote/kcoral_remote.py --remote http://127.0.0.1:8901; never run the
+benchmark on the local GPU (sm_120). Send one scoring request at a time and do not retry while one is queued: the
+Thor GPU is shared and requests can wait for its timing lock. Never change clocks or power: pass
+--clock-control none to every kcoral_ncu.py run (ncu's default locks the Thor's clocks). Start with the baseline
+self-check, then get a correct one-kernel candidate before optimizing. Remeasure a promising candidate before keeping
+it.
+```
+
+M5 (denoising loop):
+
+```text
+/goal Read ../PROMPT.md and reach at least 1.9x aggregate speedup over the deployed TensorRT denoising loop (action
+encoder, DiT and action decoder engines, 4 steps) on the Jetson Thor (stretch: 2.0x) with ONE TIRx-lite persistent
+kernel per call that passes every correctness check on all four rows. Score only through
+evolution/remote/kcoral_remote.py --remote http://127.0.0.1:8901; never run the benchmark on the local GPU (sm_120).
+Send one scoring request at a time and do not retry while one is queued: the
+Thor GPU is shared and requests can wait for its timing lock. Never change clocks or power: pass
+--clock-control none to every kcoral_ncu.py run (ncu's default locks the Thor's clocks). Start with the baseline
+self-check, then get a correct one-kernel candidate before optimizing. Remeasure a promising candidate before keeping
+it.
+```
+
 Why these targets: M1's TensorRT is latency-bound small GEMMs (2x = ~65 us, near the best per-op chain); M2's best
 chain is 1.95x and a megakernel pays 82-373 us per step in cross-CTA publishes; M4's DRAM floor caps it at 1.46x;
-M3's best chain is 2.2x and its floor 2.4x.
+M3's best chain is 2.2x and its floor 2.4x; M6's best chain is 1.69x (more than half of each block is per-kernel
+latency a megakernel can remove) and its DRAM floor 2.7x; M5's best chain is 1.94x and its floor ~2.04x (the gain is
+overlapping the next step's DiT weight stream with the boundary and the ~23 us per-step head and tail).
 
 ## 4. What the worker provides
 

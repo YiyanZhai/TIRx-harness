@@ -1,0 +1,171 @@
+name: groot_denoise_loop_thor
+# GR00T N1.7 action-head denoising loop (4 x action encoder -> DiT -> action decoder -> Euler update) of one frame on Jetson Thor, as one persistent kernel.
+workload_dir: candidates/groot/denoise_loop_thor
+kernel_authoring: TIRx-lite
+sota_baseline:
+  name: tensorrt_10_16_deployed_engines
+bench_timeout_s: 3600
+banned_paths: []
+spec: |
+  Implement the whole denoising loop of the GR00T N1.7 action head (batch 1,
+  4 steps, embodiment 2) on NVIDIA Jetson AGX Thor (compute capability 11.0,
+  CUDA target sm_110a) as ONE persistent kernel launch (a megakernel), and
+  beat the deployed sequence measured on the same Thor in the same run: the
+  TensorRT 10.16 action-encoder, DiT and action-decoder engines with the GR00T
+  runtime's PyTorch glue, 4 steps captured in one CUDA graph (2116
+  kernels). Verify the device before compiling or scoring; stop and report
+  unless its compute capability is (11, 0).
+
+  Computation. dt = 0.25. actions = initial_actions [1, 40, 132]; for step
+  s in 0..3:
+    a        = actions[0] @ W1^T + b1                                  [40, 1536]
+    z        = cat(a, timestep_embeddings[s, 0], dim=1) @ W2^T + b2    [40, 1536]
+    features = silu(z) @ W3^T + b3                                     [40, 1536]
+    sa_embs  = cat(state_features[0], features + position_embedding[0]) [41, 1536]
+    model_outputs[s, 0] = DiT(sa_embs, adaln_modulations[s], output_modulations[s])  [41, 1024]
+    h1       = relu(model_outputs[s, 0] @ L1^T + c1)                   [41, 1024]
+    prediction = h1 @ L2^T + c2                                        [41, 132]
+    actions  = actions + dt * prediction[1:41]
+  actions_out = actions. The encoder / decoder weights are fp16 in nn.Linear
+  layout [out, in] (the groot_ah_boundary_thor task's), stored h1,
+  prediction, actions, a, z, silu(z), features and sa_embs in fp16. If
+  embodiment_id[0] != 2, features and prediction are NaN, so actions_out is
+  NaN.
+  DiT (the groot_dit_step_thor task's): hidden D = 1536, 32 heads x 48, FFN
+  6144, h = sa_embs; LN is LayerNorm without affine parameters.
+    for block i in 0..31 (even i: cross-attention, odd i: self-attention):
+      scale = adaln[i, 0, :1536]; shift = adaln[i, 0, 1536:]
+      n = LN(h, eps=1e-5) * (1 + scale) + shift
+      q = Lin(blocks.i.attn1.to_q, n)
+      cross: a = MHA(q, cross_keys[i // 2, 0], cross_values[i // 2, 0], mask)
+             [32 heads, 156 keys, 48]; mask = ~image_mask & backbone_attention_mask
+             (text) if i % 4 == 0, else image_mask & backbone_attention_mask
+      self:  a = MHA(q, Lin(blocks.i.attn1.to_k, n), Lin(blocks.i.attn1.to_v, n)),
+             unmasked over the 41 tokens
+      h = h + Lin(blocks.i.attn1.to_out.0, a)
+      u = Lin(blocks.i.ff.net.0.proj, LN(h, eps=1e-5))
+      g = 0.5 u (1 + tanh(c1 (u + c0 u^3))), c0 = fp16(0.044715), c1 = fp16(0.7978845608)
+      h = h + Lin(blocks.i.ff.net.2, g)
+    shift = output_modulation[0, :1536]; scale = output_modulation[0, 1536:]
+    DiT = Lin(proj_out_2, LN(h, eps=1e-6) * (1 + scale) + shift)   [41, 1024]
+  MHA is softmax(q k^T / sqrt(48)) v per head. Lin(p, x) is NVFP4 W4A4 with
+  bias: x is quantized in blocks of 16 along K: s = fp8_e4m3(amax / (6 gsx))
+  (clamped to 448; s = 1 if it is 0), q = e2m1 round-to-nearest-even of
+  x / (s gsx), saturating at 6; y = sum_k (q s gsx)(e2m1(w) sf gsw) + b. The
+  weight p.w is e2m1 pairs [N, K/2] (even k in the low nibble), p.sf the ue4m3
+  per-16 scales [N, K/16] as raw bytes, p.gsw and p.gsx 0-dim fp32, p.b fp16
+  [N]. The DiT accumulates in fp32 and stores h, n, every linear output, a and
+  g in fp16. Other rounding, reassociation and algebraic folding are allowed
+  within the gate.
+
+  Workloads: noise0..noise3, the loop of one real LIBERO frame (its state
+  features, cross K/V and masks) from four initial noises: noise0 is the
+  frame's own draw, noise1-3 are seeded draws. The model files live on the
+  GPU worker under $HF_MODEL_PATH/groot-n17-libero-c235 (the M1 and M2 files
+  plus loop_golden.safetensors and loop_manifest.json).
+
+  Version contract: solution.py exports setup(data) -> a callable with no
+  arguments. data holds CUDA tensors:
+  - inputs initial_actions [1, 40, 132], state_features [1, 1, 1536],
+    cross_keys and cross_values [16, 1, 32, 156, 48] (fp16), image_mask and
+    backbone_attention_mask [1, 156] (bool) and embodiment_id [1] (int64):
+    new values on every call in deployment; read them on every call;
+  - constants of the deployed model: timestep_embeddings [4, 1, 40, 1536],
+    adaln_modulations [4, 32, 1, 3072], output_modulations [4, 1, 3072] and
+    position_embedding [1, 40, 1536] (fp16; the 40 rows of each timestep
+    embedding are identical);
+  - the weights L1, c1, L2, c2, W1, b1, W2, b2, W3, b3 (fp16) and
+    blocks.<i>.<linear>.{w, sf, b, gsw, gsx} and proj_out_2.{...} (NVFP4);
+  - block_types (a Python list of "cross"/"self"), Python scalars dt and
+    embodiment;
+  - the preallocated outputs actions_out [1, 40, 132] and model_outputs
+    [4, 1, 41, 1024] (fp16).
+  setup may compile, allocate scratch, prepack weights and precompute from
+  weights and the constants (for example, W2's timestep half times each
+  step's timestep embedding is one fixed vector per step, and W2's actions
+  half folds into W1). Every call must overwrite both outputs and must not
+  modify inputs or weights. One call must launch exactly one kernel on
+  torch.cuda.current_stream(), without host synchronization, allocation, or
+  other streams: the harness captures it in a CUDA graph and counts the
+  graph's kernel nodes.
+
+  Author every production kernel in TIRx-lite (import
+  tirx_kernels.tirx_lite as txl; every launched kernel comes from
+  @txl.kernel), compiled for sm_110a through the TIRx pipeline. The worker
+  exports TIRX_PREPARE_CUDA_ARCH=sm_110a, which retargets kernels traced
+  with tirx-kernels' B200 default (arch="sm_100a"); compiled for sm_100a,
+  tcgen05 kernels fail to load on Thor. Do not call TensorRT, cuBLAS,
+  PyTorch tensor operators, Triton, CUTLASS/CuTe DSL, raw CUDA, or existing
+  solution kernels for production computation. Do not change the benchmark,
+  oracle, workloads, model files, or server environment to make a candidate
+  pass.
+
+  Correctness: the oracle chains the groot_ah_boundary_thor task's float64
+  encoder / decoder emulation with the groot_dit_step_thor task's DiT
+  emulation (fp32, TF32 off, ModelOpt's NVFP4 rule). NVFP4 activation
+  quantization flips borderline roundings, so correct implementations do
+  not match it exactly; the limits are about 1.4x the larger error of
+  TensorRT and an independent implementation (our CUDA
+  DiT with a PyTorch encoder / decoder). Both outputs must be finite, with:
+  - actions_out: relative L2 at most 0.006 (correct implementations reach
+    0.0035; the mildest defects 0.021);
+  - model_outputs[s]: relative L2 at most 0.046, 0.055, 0.079, 0.098 for
+    s = 0..3;
+  - row 0 of model_outputs[s] (the state token): relative L2 at most 0.05.
+    The state reaches the actions only through attention (zeroing it moves
+    them by 0.005), so this row checks that the state is read; zeroed, it is
+    0.09-0.13 off.
+  Max abs errors are heavy-tailed, so their limits are flat (0.5 on the
+  actions, 1.0 per step) and only catch garbage elements. The gate runs repeated calls with poisoned outputs, a call after an
+  in-place change of the inputs (noise added to initial_actions and
+  state_features, and another scene's cross K/V: frame 30 of the episode,
+  which moves the actions by 0.13), the embodiment guard (NaN actions for a
+  foreign embodiment_id), and a check of the outputs left by timing. Errors
+  below the NVFP4 floor (a missing bias in one DiT block) are not detectable
+  here; before deployment a candidate must also pass the pipeline's
+  997-frame task gate.
+
+  Timing and score: the baseline and candidate graphs are replayed
+  alternately, every sample after a 128 MB read. The memory clock is warmed
+  to its maximum first. Each row's time is the median of 3 trials x 40
+  samples, and the suite holds the machine's shared GPU timing lock. Score =
+  sum of the four TensorRT medians / sum of the four candidate medians.
+  Reference points, not the score:
+  - TensorRT takes 15.8-16.0 ms per loop here (4 DiT steps of 3.81-3.90 ms
+    plus the encoder / decoder engines and glue). In baseline
+    self-checks (TensorRT in both arms) per-row ratios ranged 0.989-1.009
+    and the aggregate 0.999-1.004.
+  - DRAM floor: 7.6 ms for the 4 DiT steps (484 MB per step at 255 GB/s) plus
+    ~0.05 ms per step for the encoder / decoder weights (12 MB with W2's
+    timestep half folded, 16.8 MB unfolded, which do not survive the DiT's
+    stream through the 32 MB L2).
+  - The best per-op chain (Triton/Gluon DiT kernels chained by PDL with a
+    decoupled TMA engine, 4-kernel encoder / decoder chains) takes ~8.2 ms:
+    ~1.99 ms per DiT step, of which ~23 us is the step's head and tail (final
+    LayerNorm, output projection, block-0 LayerNorm), and 50-60 us per
+    boundary.
+  - The DiT weights do not depend on the actions, so the next step's weight
+    stream can start while the boundary (decoder, Euler update, encoder) is
+    still computing; the boundary's own 12-17 MB of weights cannot be hidden.
+  - groot_ah_boundary_thor's best single-kernel boundary takes ~45 us from
+    cold L2 (2.9x TensorRT's boundary).
+
+  Thor:
+  - 20 SMs, 228 KB shared memory per SM, 32 MB L2, ~255 GB/s achievable TMA
+    read bandwidth (with 300-400 KB in flight chip-wide).
+  - Weights must be staged into L2 with real TMA loads well ahead of use. A
+    decoupled TMA engine was worth 481 us per DiT step; shared-memory rings
+    alone are far smaller than the window needed. Load weights already
+    consumed with evict_first.
+  - L2 prefetch instructions beyond about 1 MB per burst are dropped.
+  - A valid cross-CTA release compiles to MEMBAR.ALL.GPU and waits for the
+    SM's in-flight memory operations (5-11 us with DRAM loads in flight,
+    0.4-1.7 us with only L2 hits), so CTAs that publish results should not
+    have weight streams in flight.
+  - At 192 KB of shared memory one 8-CTA cluster fits (or four 4-CTA
+    clusters).
+
+  First run the baseline self-check on Thor, then establish a correct
+  candidate and save its per-row timings. Remeasure promising candidates to
+  tell repeatable gains from noise. Do not change power or clocks during the
+  run.

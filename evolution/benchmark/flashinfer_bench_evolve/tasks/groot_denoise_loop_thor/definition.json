@@ -1,0 +1,37 @@
+{
+  "name": "groot_denoise_loop_thor",
+  "description": "GR00T N1.7 action-head denoising loop on Jetson Thor: 4 steps of action encoder (fp16 MLP), DiT (32 NVFP4 W4A4 blocks on 41 tokens) and action decoder (fp16 MLP) with the Euler update, from the initial noise to the final actions, against the deployed TensorRT 10.16 engines and runtime glue.",
+  "op_type": "denoising_loop",
+  "tags": [
+    "dtype:nvfp4",
+    "dtype:fp16",
+    "status:real",
+    "device:jetson_thor_sm110",
+    "baseline:tensorrt"
+  ],
+  "axes": {
+    "noise": {"type": "const", "values": ["noise0", "noise1", "noise2", "noise3"]},
+    "steps": {"type": "const", "value": 4},
+    "tokens": {"type": "const", "value": 41}
+  },
+  "inputs": {
+    "initial_actions": {"shape": [1, 40, 132], "dtype": "float16"},
+    "state_features": {"shape": [1, 1, 1536], "dtype": "float16"},
+    "cross_keys": {"shape": [16, 1, 32, 156, 48], "dtype": "float16"},
+    "cross_values": {"shape": [16, 1, 32, 156, 48], "dtype": "float16"},
+    "image_mask": {"shape": [1, 156], "dtype": "bool"},
+    "backbone_attention_mask": {"shape": [1, 156], "dtype": "bool"},
+    "embodiment_id": {"shape": [1], "dtype": "int64"},
+    "timestep_embeddings": {"shape": [4, 1, 40, 1536], "dtype": "float16"},
+    "adaln_modulations": {"shape": [4, 32, 1, 3072], "dtype": "float16"},
+    "output_modulations": {"shape": [4, 1, 3072], "dtype": "float16"},
+    "position_embedding": {"shape": [1, 40, 1536], "dtype": "float16"},
+    "L1, c1, L2, c2, W1, b1, W2, b2, W3, b3": {"shape": "as in groot_ah_boundary_thor", "dtype": "float16"},
+    "blocks.<i>.<linear>.{w, sf, b, gsw, gsx}, proj_out_2.{...}": {"shape": "as in groot_dit_step_thor", "dtype": "NVFP4"}
+  },
+  "outputs": {
+    "actions_out": {"shape": [1, 40, 132], "dtype": "float16"},
+    "model_outputs": {"shape": [4, 1, 41, 1024], "dtype": "float16"}
+  },
+  "reference": "from flashinfer_bench_evolve.tasks.groot_denoise_loop_thor.baseline import reference as run\n"
+}
