@@ -199,6 +199,11 @@ is overlapping the next step's DiT weight stream with the boundary and the ~23 u
   `kcoral_remote.py --cmd`. Memcheck and synccheck finish M1's persistent kernel in about a minute. Racecheck
   instruments every access of the spin loops and did not finish within an 1800 s request, holding the GPU the whole
   time; skip it for spin-loop kernels and use the local NumSim Racecheck.
+- The diagnostic tools (`kcoral_python.py`, `kcoral_ncu.py`, `kcoral_compute_sanitizer.py`, `kcoral_iket.py`) hold the
+  GPU timing lock around the tool's process, so scripts need no lock of their own; one that takes it anyway gets it
+  handed over. They wait at most 240 s, then the request fails with "retry later". For a longer wait raise both:
+  `--timeout N -e GROOT_GPU_LOCK_WAIT_S=M`, with M well below N. A run that does not touch the GPU can skip the wait
+  with `-e GROOT_GPU_LOCK=none`. `kcoral_remote.py --cmd` takes no lock: do not run GPU work through it.
 
 ## 5. Results and rechecks
 

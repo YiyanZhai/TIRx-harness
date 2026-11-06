@@ -254,7 +254,12 @@ The GPU worker needs:
   lock at most `GROOT_GPU_LOCK_WAIT_S` (default 2700 s, inside the task's
   3600 s budget), then fails with a clear error. Do not hold the same lock
   around a remote request on the client side, or the worker waits on its own
-  client.
+  client. The diagnostic tools (`kcoral_python.py`, `kcoral_ncu.py`,
+  `kcoral_compute_sanitizer.py`, `kcoral_iket.py`) hold the same lock around
+  the tool's process and hand it to a descendant that queues on it, so a suite
+  or script that takes the lock itself still works. They wait at most
+  `GROOT_GPU_LOCK_WAIT_S` (default 240 s, inside their 300 s default
+  `--timeout`). `kcoral_remote.py --cmd` does not take the lock.
 
 Each timing sample follows a 128 MB read, so the weights start in DRAM as
 they do after a DiT step. The memory clock is warmed to its maximum before

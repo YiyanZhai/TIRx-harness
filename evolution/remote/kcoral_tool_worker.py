@@ -3,6 +3,8 @@
 A separate file keeps the uploaded code easy to lint and test.
 """
 
+import contextlib
+import fcntl
 import io
 import os
 import shutil
@@ -10,7 +12,94 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
+import time
 from pathlib import Path, PurePosixPath
+
+GPU_LOCK = "/sources/.thor-gpu-timing.lock"
+GPU_LOCK_WAIT_S = "240"  # inside the tools' default 300 s request timeout
+
+
+def _below_this_process(pid):
+    try:
+        while pid > 1:
+            with open(f"/proc/{pid}/stat") as stat:
+                pid = int(stat.read().rsplit(")", 1)[1].split()[1])
+            if pid == os.getpid():
+                return True
+    except OSError:  # it exited
+        pass
+    return False
+
+
+def _queued_below_this_process(inode):
+    """Whether one of this process's descendants waits for the lock on file ``inode``."""
+    with open("/proc/locks") as locks:
+        for line in locks:
+            fields = line.split()
+            if fields[1] == "->" and fields[6].endswith(f":{inode}"):
+                if _below_this_process(int(fields[5])):
+                    return True
+    return False
+
+
+@contextlib.contextmanager
+def gpu_lock(env):
+    """Hold the machine's shared GPU timing lock, if it exists, around one tool subprocess.
+
+    Waits at most GROOT_GPU_LOCK_WAIT_S. A blocking flock in a helper thread queues like the other
+    jobs' waiters. Scripts and benchmark suites take this lock themselves, some with a hard-coded
+    path, and would wait on us forever: once a descendant queues on it, it gets the lock instead.
+    """
+
+    path = env.get("GROOT_GPU_LOCK", GPU_LOCK)
+    if not os.path.exists(path):
+        yield
+        return
+    limit = float(env.get("GROOT_GPU_LOCK_WAIT_S", GPU_LOCK_WAIT_S))
+    file = open(path)
+    acquired, abandoned, mutex = threading.Event(), threading.Event(), threading.Lock()
+
+    def take():
+        fcntl.flock(file, fcntl.LOCK_EX)
+        with mutex:
+            if abandoned.is_set():
+                file.close()
+            else:
+                acquired.set()
+
+    start = time.monotonic()
+    threading.Thread(target=take, daemon=True).start()
+    if not acquired.wait(limit):
+        with mutex:
+            if not acquired.is_set():
+                abandoned.set()
+                raise RuntimeError(
+                    f"GPU timing lock {path} busy for {limit:.0f} s (another job is timing); "
+                    "retry later, or raise --timeout and -e GROOT_GPU_LOCK_WAIT_S together"
+                )
+    print(
+        f"kcoral: GPU lock {path} held (waited {time.monotonic() - start:.1f} s)",
+        file=sys.stderr,
+        flush=True,
+    )
+    finished = threading.Event()
+
+    def hand_over():
+        inode = os.fstat(file.fileno()).st_ino
+        while not finished.wait(0.5):
+            if _queued_below_this_process(inode):
+                fcntl.flock(file, fcntl.LOCK_UN)
+                return
+
+    watcher = threading.Thread(target=hand_over, daemon=True)
+    watcher.start()
+    try:
+        yield
+    finally:
+        finished.set()
+        watcher.join()
+        file.close()
 
 
 def relative_path(name):
@@ -78,12 +167,14 @@ def _run_command(archive, command, fetch, overrides):
     with tempfile.TemporaryDirectory(prefix="kcoral_tool_") as root:
         workdir = Path(root)
         unpack_inputs(archive, workdir)
-        completed = subprocess.run(
-            [executable, *command[1:]],
-            cwd=workdir,
-            env=environment(workdir, overrides),
-            stdin=subprocess.DEVNULL,
-        )
+        env = environment(workdir, overrides)
+        with gpu_lock(env):
+            completed = subprocess.run(
+                [executable, *command[1:]],
+                cwd=workdir,
+                env=env,
+                stdin=subprocess.DEVNULL,
+            )
         files, missing = collect_files(workdir, fetch)
         return {"returncode": completed.returncode, "files": files, "missing": missing}
 
@@ -106,12 +197,13 @@ def iket(archive, arguments, overrides):
         unpack_inputs(archive, workdir)
         child_env = environment(workdir, overrides)
         child_env.setdefault("TVM_IKET_OFFICIAL_PROFILE", "cutlass-4.6.0")
-        completed = subprocess.run(
-            [executable, "--output-dir", str(reports), *arguments],
-            cwd=workdir,
-            env=child_env,
-            stdin=subprocess.DEVNULL,
-        )
+        with gpu_lock(child_env):
+            completed = subprocess.run(
+                [executable, "--output-dir", str(reports), *arguments],
+                cwd=workdir,
+                env=child_env,
+                stdin=subprocess.DEVNULL,
+            )
         paths = [p.name for p in sorted(reports.iterdir())] if reports.is_dir() else []
         files, _ = collect_files(reports, paths)
         return {
@@ -129,12 +221,15 @@ def ncu(archive, ncu_args, application, overrides):
         workdir.mkdir()
         unpack_inputs(archive, workdir)
         report = Path(root) / "capture.ncu-rep"
-        completed = subprocess.run(
-            [executable, "--config-file", "0", "--export", str(report), *ncu_args, *application],
-            cwd=workdir,
-            env=environment(workdir, overrides),
-            stdin=subprocess.DEVNULL,
-        )
+        env = environment(workdir, overrides)
+        export = ["--config-file", "0", "--export", str(report)]
+        with gpu_lock(env):
+            completed = subprocess.run(
+                [executable, *export, *ncu_args, *application],
+                cwd=workdir,
+                env=env,
+                stdin=subprocess.DEVNULL,
+            )
         return {
             "returncode": completed.returncode,
             "report": report.read_bytes() if report.is_file() else None,

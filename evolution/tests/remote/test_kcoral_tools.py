@@ -1,8 +1,11 @@
 """Core contracts for the remote tool clients and their shared transport."""
 
+import fcntl
 import io
+import subprocess
 import sys
 import tarfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +17,12 @@ from evolution.remote import kcoral_ncu as ncu
 from evolution.remote import kcoral_python as python
 from evolution.remote import kcoral_tool as tool
 from evolution.remote import kcoral_tool_worker as worker
+
+
+@pytest.fixture(autouse=True)
+def no_gpu_lock(monkeypatch):
+    """The worker's default lock path exists on the Thor; tests must not queue on the real lock."""
+    monkeypatch.setenv("GROOT_GPU_LOCK", "missing-lock")
 
 
 @pytest.fixture
@@ -412,3 +421,94 @@ def test_iket_profile_defaults_preserve_explicit_configuration(
         {} if override is None else {key: override},
     )
     assert worker.os.environ.get(key) == inherited
+
+
+def _locked(path):
+    with open(path) as file:
+        try:
+            fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+    return False
+
+
+@pytest.mark.parametrize("name", ["python", "sanitizer", "iket", "ncu"])
+def test_tools_hold_the_gpu_lock_around_the_subprocess(tmp_path, monkeypatch, name):
+    lock = tmp_path / "lock"
+    lock.touch()
+    overrides = {"GROOT_GPU_LOCK": str(lock)}
+    held = []
+
+    def run(argv, *, cwd, env, stdin):
+        held.append(_locked(lock))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(worker.shutil, "which", lambda _: "/opt/tool")
+    monkeypatch.setattr(worker.subprocess, "run", run)
+    archive = tool.pack_inputs()
+    if name == "python":
+        worker.python(archive, ["-c", "pass"], overrides)
+    elif name == "sanitizer":
+        worker.compute_sanitizer(archive, ["python"], [], overrides)
+    elif name == "iket":
+        worker.iket(archive, ["profile", "--", "python", "capture.py"], overrides)
+    else:
+        worker.ncu(archive, [], ["python", "capture.py"], overrides)
+    assert held == [True]
+    assert not _locked(lock)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_script_taking_the_gpu_lock_itself_gets_it(tmp_path, nested):
+    lock = tmp_path / "lock"
+    lock.touch()
+    # The alarm turns a self-deadlock into a failed assertion instead of a hung test.
+    source = (
+        f"import fcntl, signal; signal.alarm(20); f = open({str(lock)!r}); "
+        "fcntl.flock(f, fcntl.LOCK_EX)"
+    )
+    if nested:
+        source = (
+            f"import subprocess, sys; "
+            f"sys.exit(subprocess.run([sys.executable, '-c', {source!r}]).returncode)"
+        )
+    result = worker.python(tool.pack_inputs(), ["-c", source], {"GROOT_GPU_LOCK": str(lock)})
+    assert result["returncode"] == 0
+    assert not _locked(lock)
+
+
+def test_only_our_descendants_get_the_gpu_lock_handed_over(tmp_path, monkeypatch):
+    lock = tmp_path / "lock"
+    lock.touch()
+    waiter = f"import fcntl; fcntl.flock(open({str(lock)!r}), fcntl.LOCK_EX)"
+    inode = lock.stat().st_ino
+    with open(lock) as file:
+        fcntl.flock(file, fcntl.LOCK_EX)
+        process = subprocess.Popen([sys.executable, "-c", waiter])
+        try:
+            deadline = time.monotonic() + 20
+            while not worker._queued_below_this_process(inode):
+                assert time.monotonic() < deadline
+                time.sleep(0.05)
+            monkeypatch.setattr(worker.os, "getpid", lambda: -1)
+            assert not worker._queued_below_this_process(inode)
+        finally:
+            process.kill()
+            process.wait()
+
+
+def test_gpu_lock_wait_is_bounded(tmp_path, monkeypatch):
+    lock = tmp_path / "lock"
+    lock.touch()
+    ran = []
+    monkeypatch.setattr(worker.subprocess, "run", lambda *a, **k: ran.append(a))
+    overrides = {"GROOT_GPU_LOCK": str(lock), "GROOT_GPU_LOCK_WAIT_S": "0.2"}
+    with open(lock) as file:
+        fcntl.flock(file, fcntl.LOCK_EX)
+        with pytest.raises(RuntimeError, match="retry later"):
+            worker.python(tool.pack_inputs(), ["-c", "pass"], overrides)
+    assert not ran
+    deadline = time.monotonic() + 20  # the abandoned helper thread takes and drops the lock
+    while _locked(lock):
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
