@@ -10,18 +10,20 @@
     "baseline:tensorrt"
   ],
   "axes": {
+    "row": {"type": "const", "values": ["step0", "step1", "step2", "step3", "len140_s0", "len145_s1", "len149_s2", "len150_s3", "len151_s0", "len152_s1", "len155_s2", "len172_s3"]},
     "step": {"type": "const", "values": [0, 1, 2, 3]},
+    "vl_tokens": {"type": "const", "values": [140, 145, 149, 150, 151, 152, 155, 156, 172]},
     "tokens": {"type": "const", "value": 41},
     "blocks": {"type": "const", "value": 32}
   },
   "inputs": {
     "sa_embs": {"shape": [1, 41, 1536], "dtype": "float16"},
-    "cross_keys": {"shape": [16, 1, 32, 156, 48], "dtype": "float16"},
-    "cross_values": {"shape": [16, 1, 32, 156, 48], "dtype": "float16"},
+    "cross_keys": {"shape": [16, 1, 32, "L", 48], "dtype": "float16"},
+    "cross_values": {"shape": [16, 1, 32, "L", 48], "dtype": "float16"},
     "adaln_modulations": {"shape": [32, 1, 3072], "dtype": "float16"},
     "output_modulation": {"shape": [1, 3072], "dtype": "float16"},
-    "image_mask": {"shape": [1, 156], "dtype": "bool"},
-    "backbone_attention_mask": {"shape": [1, 156], "dtype": "bool"},
+    "image_mask": {"shape": [1, "L"], "dtype": "bool"},
+    "backbone_attention_mask": {"shape": [1, "L"], "dtype": "bool"},
     "blocks.<i>.<linear>.w": {"shape": ["N", "K/2"], "dtype": "uint8"},
     "blocks.<i>.<linear>.sf": {"shape": ["N", "K/16"], "dtype": "uint8 (ue4m3 bytes)"},
     "blocks.<i>.<linear>.b": {"shape": ["N"], "dtype": "float16"},

@@ -22,7 +22,7 @@ spec: |
       n = LN(h, eps=1e-5) * (1 + scale) + shift
       q = Lin(blocks.i.attn1.to_q, n)
       cross: a = MHA(q, cross_keys[i // 2, 0], cross_values[i // 2, 0], mask)
-             [32 heads, 156 keys, 48]; mask = ~image_mask & backbone_attention_mask
+             [32 heads, L keys, 48]; mask = ~image_mask & backbone_attention_mask
              (text) if i % 4 == 0, else image_mask & backbone_attention_mask
       self:  a = MHA(q, Lin(blocks.i.attn1.to_k, n), Lin(blocks.i.attn1.to_v, n)),
              unmasked over the 41 tokens
@@ -42,9 +42,16 @@ spec: |
   stores h, n, every linear output, a and g in fp16. Other rounding and
   accumulation orders are allowed within the gate.
 
-  Workloads: step0..step3, the four denoising steps of one real LIBERO frame
-  (sa_embs and the two modulations differ per step; K/V and masks are
-  per-frame). The model files live on the GPU worker under
+  Workloads: twelve rows, denoising steps of one real LIBERO frame (sa_embs
+  and the two modulations differ per step; K/V and masks are per-frame).
+  step0..step3 are its four steps under the frame's own instruction, with L =
+  156 vision-language (VL) tokens. len140_s0, len145_s1, len149_s2, len150_s3,
+  len151_s0, len152_s1, len155_s2 and len172_s3 are step s of the same frame
+  under another instruction, with L VL tokens. L is 128 image tokens plus the
+  instruction's text tokens, so it follows the instruction: LIBERO-10's ten
+  tasks have 145, 149 (four tasks), 150, 151, 152, 155 and 156, and only one of
+  them has 156. 140 and 172 are a shorter and a longer instruction. Handle any
+  L from 136 to 176. The model files live on the GPU worker under
   $HF_MODEL_PATH/groot-n17-libero-c235 (dit_* files).
 
   Version contract: solution.py exports setup(data) -> a callable with no
@@ -65,6 +72,19 @@ spec: |
   other streams: the harness captures it in a CUDA graph and counts the
   graph's kernel nodes.
 
+  L comes from the tensors' shapes in setup. The tensors hold exactly L keys,
+  so reading past L is out of bounds. The deployed runtime keeps one
+  action-head CUDA graph per token count, captured before serving: setup runs
+  once per step and L in one process (this suite's rows share one process and
+  one weights dict), and the graphs of different L replay one at a time on one
+  stream. So a launch must keep working after later setups: the suite calls
+  the first row's launch again after each row with another L, and gates it.
+  Setups may share packed weights and compiled code, and a setup after the
+  first row's must finish within 60 s. Compiling per L, one compile that takes
+  L at run time, and a fixed internal layout that masks the keys beyond L are
+  all allowed; padded keys that are not masked dilute the attention and fail
+  the gate.
+
   Author every production kernel in TIRx-lite (import
   tirx_kernels.tirx_lite as txl; every launched kernel comes from
   @txl.kernel), compiled for sm_110a through the TIRx pipeline. The worker
@@ -77,25 +97,32 @@ spec: |
 
   Correctness: the oracle is an independent PyTorch emulation of the
   exported graph (fp32, TF32 off, ModelOpt's quantization rule). Each step's
-  output must be finite, with a relative L2 error of at most 0.039, 0.047,
-  0.054, 0.069 and a max abs error of at most 0.16, 0.17, 0.16, 0.23 for
+  output must be finite, with a relative L2 error of at most 0.046, 0.047,
+  0.058, 0.070 and a max abs error of at most 0.28, 0.18, 0.24, 0.23 for
   steps 0..3. These limits are 1.4x and 2x the larger error of TensorRT and
-  an independent Triton implementation: dynamic NVFP4 activation
+  an independent Triton implementation over the rows: dynamic NVFP4 activation
   quantization flips borderline roundings, so correct implementations differ
-  from the oracle by 0.026-0.049 relative L2. The gate runs repeated calls
+  from the oracle by 0.026-0.050 relative L2. The gate runs repeated calls
   with poisoned outputs, a call after an in-place change of sa_embs,
   cross_keys, cross_values and image_mask (limits 0.10 / 0.35), and a check
   of the output left by timing. Errors below the NVFP4 floor (a missing bias
-  in one block, a wrong epsilon) are not detectable here; before deployment
+  in one block, a wrong epsilon, a mask wrong by one key) are not detectable here; before deployment
   a candidate must also pass the pipeline's 997-frame task gate.
 
   Timing and score: the baseline and candidate graphs are replayed
   alternately, every sample after a 128 MB read. The memory clock is warmed
-  to its maximum first. Each step's time is the median of 3 trials x 60
+  to its maximum first. Each row's time is the mean of 3 trials x 60
   samples, and the suite holds the machine's shared GPU timing lock. Score =
-  sum of the four TensorRT medians / sum of the four candidate medians.
+  sum of the twelve TensorRT means / sum of the twelve candidate means. The mean,
+  because a frame's time is the sum of four calls and follows the mean of a
+  call: the first evolved kernel's per-step medians summed to 7.57-7.63 ms in
+  the pipeline, while its frames took 7.87-7.92 ms. The suite also reports each
+  row's median and p95.
   Reference points, not the score:
   - TensorRT takes 3.81-3.90 ms per step here.
+  - Per call in this suite's protocol, the per-op chain means ~2.06 ms. The first
+    evolved kernel has a fast mode at ~1.93 ms and a slow mode near 2.18 ms, with
+    a mean of 2.02-2.04 ms: about 1.9x at the mean, 2.0x at the median.
   - The DRAM floor is 1.90 ms per step: 484 MB (469 MB of weights, scales and
     biases plus 15 MB of K/V) at 255 GB/s.
   - The best per-op chain (Triton/Gluon kernels chained by PDL, plus a
@@ -118,6 +145,14 @@ spec: |
     have weight streams in flight.
   - At 192 KB of shared memory one 8-CTA cluster fits (or four 4-CTA
     clusters).
+  - Under GPU load the DVFS polling kworker (devfreq_wq) runs about 25 % of the
+    time, in bursts (two of ~2.5 ms every ~20 ms), and GPU DRAM bandwidth falls
+    from ~256 to 150-230 GB/s in them. It cannot be turned off here. Its cost
+    depends on the design: in calls where the kworker ran for at least 30 % of
+    the step, the first evolved kernel, whose stream runs at the DRAM floor, was
+    ~130 us slower than in calls without it, and the per-op chain ~28 us. This is
+    the main source of that kernel's slow mode as far as measured, so a design
+    that keeps its fast mode through a burst gains more than a faster fast mode.
   - Tile-contiguous weights (one contiguous block per TMA box) lift streaming
     from ~180 to 210-230 GB/s.
 

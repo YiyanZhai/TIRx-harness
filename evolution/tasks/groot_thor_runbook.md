@@ -92,9 +92,9 @@ it: per-row noise is about +-4 %, aggregate about +-2 %.
 M2:
 
 ```text
-/goal Read ../PROMPT.md and reach at least 1.5x aggregate speedup over the deployed TensorRT DiT engine on the Jetson
-Thor (stretch: 1.9x) with ONE TIRx-lite persistent kernel per DiT step that passes every correctness check on all
-four steps. Score only through evolution/remote/kcoral_remote.py --remote http://127.0.0.1:8901; never run the
+/goal Read ../PROMPT.md and reach at least 1.95x aggregate speedup (means) over the deployed TensorRT DiT engine on the
+Jetson Thor (stretch: 2.0x) with ONE TIRx-lite persistent kernel per DiT step that passes every correctness check on all
+twelve rows, including the token-count rows. Score only through evolution/remote/kcoral_remote.py --remote http://127.0.0.1:8901; never run the
 benchmark on the local GPU (sm_120). Send one scoring request at a time and do not retry while one is queued: the
 Thor GPU is shared and requests can wait for its timing lock. Never change clocks or power: pass
 --clock-control none to every kcoral_ncu.py run (ncu's default locks the Thor's clocks). Start with the baseline
@@ -155,9 +155,9 @@ self-check, then get a correct one-kernel candidate before optimizing. Remeasure
 it.
 ```
 
-Why these targets: M1's TensorRT is latency-bound small GEMMs (2x = ~65 us, near the best per-op chain); M2's best
-chain is 1.95x (the 82-373 us per step publish cost once quoted here came from a composite whose loader kept the
-whole ring in flight; it was withdrawn, and the evolved M2 beats our production chain by ~3-5 % per step); M4's
+Why these targets: M1's TensorRT is latency-bound small GEMMs (2x = ~65 us, near the best per-op chain); M2's score uses means now, where the
+per-op chain is about 1.88x, the first evolved kernel about 1.9x and the DRAM floor 2.03x (the 82-373 us per step publish
+cost once quoted here came from a composite whose loader kept the whole ring in flight; it was withdrawn); M4's
 DRAM floor caps it at 1.46x;
 M3's best chain is 2.2x and its floor 2.4x; M6's best chain is 1.69x (more than half of each block is per-kernel
 latency a megakernel can remove) and its DRAM floor 2.7x; M5's best chain is 1.94x, the evolved M2 with the chain's glue about 2.0x in the pipeline, and its floor ~2.04x (the gain

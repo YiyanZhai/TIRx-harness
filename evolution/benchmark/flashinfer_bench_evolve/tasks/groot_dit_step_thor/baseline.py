@@ -2,7 +2,7 @@
 """TensorRT timing baseline and oracle for one GR00T N1.7 DiT denoising step.
 
 The DiT runs 32 transformer blocks on 41 tokens (hidden 1536, 32 heads x 48, FFN 6144). Even
-blocks cross-attend to precomputed per-frame K/V [16, 1, 32, 156, 48] (text mask when the block
+blocks cross-attend to precomputed per-frame K/V [16, 1, 32, L, 48] (text mask when the block
 index is a multiple of 4, image mask otherwise); odd blocks self-attend. Every linear is NVFP4
 W4A4: the input is quantized dynamically (per-16 e2m1 with ue4m3 scales under a static global
 scale gsx), the weight is e2m1 with ue4m3 per-16 scales under a global scale gsw.
@@ -48,6 +48,21 @@ GELU_C1 = float(torch.tensor(0.7978845608, dtype=torch.float16))
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 
 
+def vl_tokens(row):
+    """The row's VL token count (128 image tokens + the instruction's text tokens)."""
+
+    return int(row[3:row.index("_")]) if row.startswith("len") else 156
+
+
+def row_tensor(golden, row, k, name):
+    """A len row's own `<row>.<name>`; otherwise the frame's shared `<name>` or step k's `step<k>.<name>`."""
+
+    for key in (f"{row}.{name}", name):
+        if key in golden:
+            return golden[key]
+    return golden[f"step{k}.{name}"]
+
+
 def model_dir() -> Path:
     """The provisioned model directory (no download source exists)."""
 
@@ -56,7 +71,7 @@ def model_dir() -> Path:
     if not (path / "dit_manifest.json").is_file():
         raise FileNotFoundError(
             f"{path} has no DiT files; build them with groot-perf-diagnosis kda/tirx/m2_prepare.py "
-            "and point HF_MODEL_PATH at the directory's parent"
+            "and m2_lens.py and point HF_MODEL_PATH at the directory's parent"
         )
     return path
 
@@ -69,6 +84,7 @@ def load_model(device):
     path = model_dir()
     weights = {k: v.to(device) for k, v in load_file(str(path / "dit_weights.safetensors")).items()}
     golden = load_file(str(path / "dit_golden.safetensors"))
+    golden.update(load_file(str(path / "dit_lens.safetensors")))
     block_types = json.loads((path / "dit_manifest.json").read_text())["block_types"]
     return weights, golden, block_types
 

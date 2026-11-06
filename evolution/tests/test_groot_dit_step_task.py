@@ -27,7 +27,9 @@ def test_task_plan_and_bundle():
         shape_mode=mode,
     )
     assert rows == bench.make_workloads(replace(bench.default_config(), **overrides))
-    assert [row["axes"]["step"] for row in rows] == [0, 1, 2, 3] and candidate is None
+    assert [row["axes"]["row"] for row in rows] == list(bench.ROWS) and candidate is None
+    assert [row["axes"]["step"] for row in rows] == [0, 1, 2, 3] * 3
+    assert [row["axes"]["vl_tokens"] for row in rows] == [156] * 4 + [140, 145, 149, 150, 151, 152, 155, 172]
     sources = adapter.harness_sources(name)
     # The shared timing and lock helpers travel with the bundle.
     for file in (
@@ -60,3 +62,21 @@ def test_gate_limits():
     bad[0, 0, 0] = float("nan")
     with pytest.raises(AssertionError, match="non-finite"):
         bench._check(bad, expected, 1.0, 1.0, "nan")
+
+
+def test_len_rows_read_their_own_tensors():
+    golden = {
+        "cross_keys": torch.zeros(16, 1, 32, 156, 48).half(),
+        "step1.sa_embs": torch.zeros(1, 41, 1536).half(),
+        "step1.adaln_modulations": torch.zeros(32, 1, 3072).half(),
+        "len145_s1.cross_keys": torch.zeros(16, 1, 32, 145, 48).half(),
+        "len145_s1.sa_embs": torch.ones(1, 41, 1536).half(),
+    }
+    tensor = bench.baseline.row_tensor
+    assert tensor(golden, "step1", 1, "cross_keys") is golden["cross_keys"]
+    assert tensor(golden, "step1", 1, "sa_embs") is golden["step1.sa_embs"]
+    assert tensor(golden, "len145_s1", 1, "cross_keys").shape[3] == 145
+    assert tensor(golden, "len145_s1", 1, "sa_embs") is golden["len145_s1.sa_embs"]
+    assert tensor(golden, "len145_s1", 1, "adaln_modulations") is golden["step1.adaln_modulations"]
+    assert bench.baseline.vl_tokens("step2") == 156 and bench.baseline.vl_tokens("len172_s3") == 172
+

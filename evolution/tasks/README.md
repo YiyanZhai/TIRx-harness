@@ -290,15 +290,20 @@ step of the GR00T N1.7 DiT on Jetson AGX Thor (sm_110a). The step is 32
 NVFP4 W4A4 transformer blocks on 41 tokens, alternating cross- and
 self-attention, plus the output head. The task requires one persistent
 kernel per call: the harness counts the kernel nodes of the captured
-candidate graph. The four rows are the four steps of one real LIBERO frame,
-and the score is the sum of the TensorRT medians divided by the sum of the
-candidate medians. TensorRT runs 516 kernels and takes 3.86-3.89 ms per step
+candidate graph. The twelve rows are denoising steps of one real LIBERO frame:
+its four steps at the frame's 156 VL tokens, and eight steps under other
+instructions, with 140-172 VL tokens. Setup runs per step and token count in one
+process, and the suite checks that the first setup still works after later
+ones. The score is the sum of the TensorRT means divided by the sum of the
+candidate means: a frame sums four calls, so it follows the mean of a call, and
+per-call times can be bimodal. TensorRT runs 516 kernels and takes 3.86-3.89 ms per step
 here. The DRAM floor is 1.90 ms.
 
 The model files (`dit_nvfp4.engine`, `dit_weights.safetensors`,
-`dit_golden.safetensors`, `dit_manifest.json`) sit in the same
-`groot-n17-libero-c235` directory as the action-head task. They are built by
-`kda/tirx/m2_prepare.py` in groot-perf-diagnosis. The worker requirements,
+`dit_golden.safetensors`, `dit_manifest.json`, `dit_lens.safetensors`,
+`dit_lens_manifest.json`) sit in the same `groot-n17-libero-c235` directory as the
+action-head task. They are built by `kda/tirx/m2_prepare.py` and `m2_lens.py` in
+groot-perf-diagnosis. The worker requirements,
 timing protocol and lock are the action-head task's: the task imports that
 task's helpers, so both packages travel together.
 

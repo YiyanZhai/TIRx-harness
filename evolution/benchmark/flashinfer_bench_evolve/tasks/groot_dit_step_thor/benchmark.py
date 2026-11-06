@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """GR00T N1.7 DiT denoising step on Jetson Thor, against the deployed TensorRT engine.
 
-Each workload row is one of the four denoising steps of a real frame. Timing, graph capture,
+Each workload row is one denoising step of a real frame. step0-3 are the frame's own instruction
+(156 VL tokens). len<L>_s<k> are step k of the same frame under another instruction, so with L VL
+tokens: LIBERO-10's tasks have 145-156, and only one of the ten has 156. The deployed runtime keeps
+one action-head graph per token count, so setup runs once per step and count in one process, and a
+setup made earlier must keep working after later ones; the suite checks that. Timing, graph capture,
 the kernel-node count and the shared GPU lock reuse the action-head boundary task's validated
 helpers: alternating graph replays, each sample after a 128 MB L2-evicting read, memory clock
 warmed first.
+
+The score uses each row's mean, not its median. A frame's time is the sum of four calls, so it follows
+the mean of a call. Per-call times can be bimodal: the first evolved kernel's medians summed to
+7.57-7.63 ms per frame in the pipeline while its frames took 7.87-7.92 ms.
 
 The correctness gate sits at the NVFP4 noise floor. TensorRT and an independent Triton
 implementation differ from the oracle by a relative L2 error of 0.026-0.049 per step (dynamic
@@ -16,6 +24,7 @@ detectable here.
 from __future__ import annotations
 
 import statistics
+import time
 
 import torch
 
@@ -36,11 +45,26 @@ HARNESS_FILES = tuple(
 )
 
 # Per step: 1.4x the larger relative L2 error, and 2x the larger max abs error, of TensorRT and the
-# independent Triton implementation against the oracle (calibrated on the golden frame).
-MAX_REL = (0.039, 0.047, 0.054, 0.069)
-MAX_ABS = (0.16, 0.17, 0.16, 0.23)
+# independent Triton implementation against the oracle, over all rows of that step (groot-perf-diagnosis
+# kda/tirx/m2_calib.py). A mask wrong by one key (0.039-0.066) sits inside these limits.
+MAX_REL = (0.046, 0.047, 0.058, 0.070)
+MAX_ABS = (0.28, 0.18, 0.24, 0.23)
 PROBE_MAX_REL, PROBE_MAX_ABS = 0.10, 0.35  # after the in-place input change (detects stale outputs)
 MUTABLE = ("sa_embs", "cross_keys", "cross_values")  # new values every call in deployment
+STEP_ROWS = ("step0", "step1", "step2", "step3")
+LEN_ROWS = (
+    "len140_s0",
+    "len145_s1",
+    "len149_s2",
+    "len150_s3",
+    "len151_s0",
+    "len152_s1",
+    "len155_s2",
+    "len172_s3",
+)
+ROWS = (*STEP_ROWS, *LEN_ROWS)
+# A setup after the first row's may compile for its token count, but must not take this long.
+SETUP_MAX_S = 60.0
 
 
 def default_config():
@@ -51,21 +75,26 @@ def make_workloads(config=None):
     return [
         {
             "suite": "official",
-            "id": f"step{k}",
-            "axes": {"step": k, "tokens": 41, "blocks": 32},
-            "raw": {"uuid": f"step{k}"},
+            "id": row,
+            "axes": {
+                "row": row,
+                "step": int(row[-1]),
+                "vl_tokens": baseline.vl_tokens(row),
+                "tokens": 41,
+                "blocks": 32,
+            },
+            "raw": {"uuid": row},
         }
-        for k in range(4)
+        for row in ROWS
     ]
 
 
-def make_data(weights, golden, block_types, k, device):
-    """The data dict for step k: weights, fresh input copies, the preallocated output."""
+def make_data(weights, golden, block_types, row, k, device):
+    """The data dict for a row at step k: weights, fresh input copies, the preallocated output."""
 
     data = dict(weights)
     for name in baseline.INPUTS:
-        key = name if name in golden else f"step{k}.{name}"
-        data[name] = golden[key].to(device).clone()
+        data[name] = baseline.row_tensor(golden, row, k, name).to(device).clone()
     data["output"] = torch.empty(1, 41, 1024, dtype=torch.float16, device=device)
     data["block_types"] = list(block_types)
     return data
@@ -109,22 +138,36 @@ def _perturb(data, seed):
 
 
 def _run_row(
-    k, weights, golden, block_types, device, cfg, candidate_fn, candidate_prepare_fn, flush
+    row, k, weights, golden, block_types, device, cfg, candidate_fn, candidate_prepare_fn, flush, first
 ):
     stream = torch.cuda.Stream(device)
     limits = (MAX_REL[k], MAX_ABS[k])
-    base_data = make_data(weights, golden, block_types, k, device)
+    tokens = baseline.vl_tokens(row)
+    base_data = make_data(weights, golden, block_types, row, k, device)
     base = baseline.TrtDitStep(base_data)
     expected = baseline.reference(base_data, block_types)
     base_data["output"].fill_(float("nan"))
     common._call(base, stream)
     base_rel, base_abs = _check(base_data["output"], expected, *limits, "TensorRT baseline")
 
-    data = make_data(weights, golden, block_types, k, device)
+    data = make_data(weights, golden, block_types, row, k, device)
+    setup_s = 0.0
     if candidate_fn is None:  # self-check: the baseline in both arms
         candidate = baseline.TrtDitStep(data)
     else:
-        launch = candidate_prepare_fn(data)
+        started = time.perf_counter()
+        try:
+            launch = candidate_prepare_fn(data)
+        except Exception as exc:
+            raise AssertionError(
+                f"setup failed at {tokens} VL tokens: {type(exc).__name__}: {exc}"
+            ) from exc
+        setup_s = time.perf_counter() - started
+        if first and setup_s > SETUP_MAX_S:
+            raise AssertionError(
+                f"setup at {tokens} VL tokens took {setup_s:.0f} s (limit {SETUP_MAX_S:.0f} s after "
+                "the first row's)"
+            )
 
         def candidate():
             return candidate_fn(launch)
@@ -165,6 +208,26 @@ def _run_row(
             data[name].copy_(snapshot[name])
         checks += 1
 
+    if first and first["tokens"] != tokens:  # the setup of the first count still works after this one
+        first["data"]["output"].fill_(float("nan"))
+        common._call(first["candidate"], first["stream"])
+        _check(
+            first["data"]["output"],
+            first["expected"],
+            *first["limits"],
+            f"the {first['tokens']}-token setup called again after the {tokens}-token one",
+        )
+        checks += 1
+    if not first:
+        first.update(
+            tokens=tokens,
+            data=data,
+            expected=expected,
+            limits=limits,
+            candidate=candidate,
+            stream=stream,
+        )
+
     graphs = {}  # destroyed before the engines and modules whose kernels they captured
     try:
         try:
@@ -184,8 +247,8 @@ def _run_row(
         _check(data["output"], expected, *limits, "output left by timing")
         checks += 1
     unchanged("timing")
-    baseline_ms = statistics.median(samples["baseline"])
-    kernel_ms = statistics.median(samples["candidate"])
+    baseline_ms = statistics.mean(samples["baseline"])
+    kernel_ms = statistics.mean(samples["candidate"])
     return dict(
         passed=True,
         verdict="PASS",
@@ -199,6 +262,10 @@ def _run_row(
         baseline_ms=baseline_ms,
         kernel_ms=kernel_ms,
         speedup=baseline_ms / kernel_ms,
+        vl_tokens=tokens,
+        setup_s=setup_s,
+        baseline_median_ms=statistics.median(samples["baseline"]),
+        kernel_median_ms=statistics.median(samples["candidate"]),
         baseline_p95_ms=common._p95(samples["baseline"]),
         kernel_p95_ms=common._p95(samples["candidate"]),
         samples=len(samples["candidate"]),
@@ -219,12 +286,20 @@ def _print_aggregate(rows):
     total_baseline = sum(row["baseline_ms"] for row in rows)
     total_kernel = sum(row["kernel_ms"] for row in rows)
     print()
-    print("# Aggregate result (the four denoising steps of one frame)")
+    print("# Aggregate result (means; one frame: four steps, eight rows at other token counts)")
     print(
         f"| candidate ({len(rows)}/{len(rows)} PASS) | {total_kernel * 1000:.1f}us | "
         f"TensorRT {total_baseline * 1000:.1f}us | {total_baseline / total_kernel:.3f}x |",
         flush=True,
     )
+    print("| row | VL tokens | candidate mean / median / p95 ms | TensorRT mean ms | speedup | setup s |")
+    for row in rows:
+        print(
+            f"| {row['id']} | {row['vl_tokens']} | {row['kernel_ms']:.3f} / "
+            f"{row['kernel_median_ms']:.3f} / {row['kernel_p95_ms']:.3f} | {row['baseline_ms']:.3f} | "
+            f"{row['speedup']:.3f}x | {row['setup_s']:.1f} |",
+            flush=True,
+        )
 
 
 @torch.no_grad()
@@ -250,16 +325,18 @@ def run_suite(config=None, candidate_fn=None, workloads=None, candidate_prepare_
             torch.sum(flush_src, dim=0, out=flush_dst)
 
         print(
-            f"OP: {TASK_NAME} ({len(entries)} steps, "
+            f"OP: {TASK_NAME} ({len(entries)} rows, "
             f"warmup/iters/trials {cfg.warmup}/{cfg.iters}/{cfg.trials})"
         )
         rows = []
+        first = {}  # the first row's setup, kept to check it after the setups of other token counts
         for entry in entries:
             k = int(entry["axes"]["step"])
             row = {"suite": entry["suite"], "id": entry["id"], "axes": entry["axes"]}
             try:
                 row.update(
                     _run_row(
+                        entry["axes"]["row"],
                         k,
                         weights,
                         golden,
@@ -269,6 +346,7 @@ def run_suite(config=None, candidate_fn=None, workloads=None, candidate_prepare_
                         candidate_fn,
                         candidate_prepare_fn,
                         flush,
+                        first,
                     )
                 )
             except AssertionError as exc:
@@ -285,9 +363,10 @@ def run_suite(config=None, candidate_fn=None, workloads=None, candidate_prepare_
             rows.append(row)
             print(row, flush=True)
             torch.cuda.empty_cache()
+        first.clear()
     _print_aggregate(rows)
     if all(row["passed"] for row in rows):
-        summarize(rows, "step")
+        summarize(rows, "row")
     return rows
 
 
